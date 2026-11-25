@@ -1,0 +1,14 @@
+[Unit]
+Description=Subway departure board on home Wi-Fi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/subwayguide
+ExecStart=%h/subwayguide/.venv/bin/python %h/subwayguide/server/serve.py --host 0.0.0.0 --refresh-catalog
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

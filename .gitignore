@@ -1,0 +1,23 @@
+.DS_Store
+*.apk
+*.jks
+*.keystore
+*.pem
+*.p12
+.env
+.env.*
+local.properties
+.gradle/
+.idea/
+__pycache__/
+.venv/
+*.pyc
+*.db
+/android/build/
+/android/app/build/
+/dist/
+
+# Local research and historical design records
+/SUBWAY_BOARD_RESEARCH.md
+/docs/design/
+/docs/design-research.md

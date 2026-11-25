@@ -6,6 +6,7 @@ import com.chaquo.python.PyObject;
 import com.chaquo.python.Python;
 import com.chaquo.python.android.AndroidPlatform;
 import java.io.InputStream;
+import java.io.File;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -32,6 +33,18 @@ public final class LocalBoard {
     requireWorkerThread();
     JSONObject directory = new JSONObject(call(context, "stations_json").toString());
     return directory.getJSONArray("stations");
+  }
+
+  /** Downloads an update without importing or initializing embedded_board. */
+  public static long downloadUpdate(Context context, File destination) throws Exception {
+    requireWorkerThread();
+    if (context == null) throw new IllegalArgumentException("Context is required");
+    PyObject downloader;
+    synchronized (LOCK) {
+      if (!Python.isStarted()) Python.start(new AndroidPlatform(context.getApplicationContext()));
+      downloader = Python.getInstance().getModule("update_downloader");
+    }
+    return downloader.callAttr("download", destination.getAbsolutePath()).toLong();
   }
 
   private static PyObject call(Context context, String method, Object... args) {

@@ -32,11 +32,11 @@ def check(apk_path, work, live):
                 inner.extractall(work / "modules")
 
     modules = work / "modules"
-    for name in ("context_feeds", "embedded_board", "refresh_catalog", "serve", "transit"):
+    for name in ("context_feeds", "embedded_board", "refresh_catalog", "serve", "transit", "update_downloader"):
         shipped = (modules / f"{name}.pyc").read_bytes()
         assert shipped[:4] == importlib.util.MAGIC_NUMBER, "run with the Python 3.11 build interpreter"
         code = marshal.loads(shipped[16:])
-        source_dir = "android/src/main/python" if name == "embedded_board" else "server"
+        source_dir = "android/src/main/python" if name in ("embedded_board", "update_downloader") else "server"
         source = (ROOT / source_dir / f"{name}.py").read_bytes()
         assert compile(source, code.co_filename, "exec") == code, f"outdated APK module: {name}"
 

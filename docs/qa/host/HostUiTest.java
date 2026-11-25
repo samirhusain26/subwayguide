@@ -283,6 +283,8 @@ public class HostUiTest {
   final JSONObject[] saved = {null};
   final String[] tested = {null};
   boolean canceled;
+  boolean updateDownloadRequested;
+  boolean updateInstallRequested;
   SettingsScreen.Listener listener =
       new SettingsScreen.Listener() {
         public void testChime() {}
@@ -300,6 +302,10 @@ public class HostUiTest {
         }
 
         public void changeSource(String s) {}
+
+        public void downloadUpdate() { updateDownloadRequested = true; }
+
+        public void installUpdate() { updateInstallRequested = true; }
       };
 
   static void reach(View root, String label) {
@@ -331,10 +337,11 @@ public class HostUiTest {
     show(s);
     save(s, "settings-trip");
     assertTrue(named(s, "Update app").performClick());
-    Intent update = Shadows.shadowOf(activity).getNextStartedActivity();
-    assertEquals(Intent.ACTION_VIEW, update.getAction());
-    assertEquals("https://github.com/samirhusain26/subwayguide/releases/latest/download/SubwayBoard.apk",
-        update.getDataString());
+    assertTrue(named(s, "Download latest update").performClick());
+    assertTrue(updateDownloadRequested);
+    s.setUpdateState("The latest update is downloaded and ready to install.", true);
+    assertTrue(named(s, "Install update").performClick());
+    assertTrue(updateInstallRequested);
     assertTrue(named(s, "Connection").performClick());
     save(s, "settings-connection");
     assertTrue(named(s, "This phone").isSelected());

@@ -37,4 +37,4 @@ done
   -Drobolectric.dependency.repo.url=https://repo.maven.apache.org/maven2 \
   -DassetDir="$root/android/app/src/main/assets" -DcatalogFile="$root/server/stations.json" -DoutDir="$out" \
   -classpath "$scratch/classes:$classpath:$android_jar" \
-  org.junit.runner.JUnitCore nyc.subway.board.HostUiTest nyc.subway.board.AppFlowTest
+  org.junit.runner.JUnitCore nyc.subway.board.HostUiTest nyc.subway.board.AppFlowTest nyc.subway.board.UpdateInstallerTest

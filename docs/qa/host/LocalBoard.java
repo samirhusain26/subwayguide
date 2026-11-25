@@ -3,6 +3,7 @@ package nyc.subway.board;
 import android.content.Context;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.io.File;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -23,5 +24,9 @@ final class LocalBoard {
   static JSONArray stations(Context context) throws Exception {
     return new JSONObject(Files.readString(Path.of(System.getProperty("catalogFile"))))
         .getJSONArray("stations");
+  }
+
+  static long downloadUpdate(Context context, File destination) throws Exception {
+    throw new UnsupportedOperationException("Update download is exercised only on Android runtime.");
   }
 }

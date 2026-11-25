@@ -1,18 +1,23 @@
 package nyc.subway.board;
 
 import android.app.Activity;
+import android.content.Context;
 import android.app.AlertDialog;
+import android.os.Looper;
 import android.content.SharedPreferences;
+import android.content.Intent;
 import android.media.AudioManager;
 import android.media.ToneGenerator;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.net.Uri;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Toast;
 import java.io.InputStream;
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.HashSet;
@@ -21,6 +26,7 @@ import java.util.Set;
 import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -28,6 +34,11 @@ import org.json.JSONObject;
 public final class MainActivity extends Activity {
   private final Handler handler = new Handler();
   private final ExecutorService network = Executors.newFixedThreadPool(2);
+  private static final ExecutorService UPDATE_EXECUTOR = Executors.newSingleThreadExecutor();
+  private static final Handler UPDATE_HANDLER = new Handler(Looper.getMainLooper());
+  private static volatile MainActivity updateActivity;
+  private static final AtomicBoolean UPDATE_DOWNLOADING = new AtomicBoolean();
+  static final AtomicBoolean UPDATE_INSTALLING = new AtomicBoolean();
   private final List<RouteSnapshot> routeSnapshots = new ArrayList<>();
   private SharedPreferences prefs;
   private JSONObject config;
@@ -144,8 +155,11 @@ public final class MainActivity extends Activity {
   @Override
   protected void onResume() {
     super.onResume();
+    updateActivity = this;
+    UPDATE_INSTALLING.set(false);
     resumed = true;
     restart();
+    if (editor != null) refreshUpdateState();
   }
 
   @Override
@@ -159,6 +173,7 @@ public final class MainActivity extends Activity {
 
   @Override
   protected void onDestroy() {
+    if (updateActivity == this) updateActivity = null;
     catalogRequest++;
     network.shutdownNow();
     if (tone != null) tone.release();
@@ -620,12 +635,154 @@ public final class MainActivity extends Activity {
                 if (fallback != null) editor.setStations(fallback);
                 if (editor.hasSource("") || !origin.isEmpty()) refreshCatalog(origin, true);
               }
+
+              @Override
+              public void downloadUpdate() {
+                startUpdateDownload();
+              }
+
+              @Override
+              public void installUpdate() {
+                beginUpdateInstall();
+              }
             });
     immersive(false);
     adjustBrightness(System.currentTimeMillis() / 1000);
     setContentView(editor);
+    refreshUpdateState();
     String savedOrigin = config.optString("server");
     refreshCatalog(savedOrigin, true);
+  }
+
+  private File updateApk() {
+    return new File(new File(getFilesDir(), "update"), "SubwayBoard.apk");
+  }
+
+  private void refreshUpdateState() {
+    if (editor == null) return;
+    if (UPDATE_DOWNLOADING.get()) {
+      editor.setUpdateState("Downloading the latest update…", false, true);
+      return;
+    }
+    if (UPDATE_INSTALLING.get()) {
+      editor.setUpdateState("Android is processing the update. Finish or cancel the installer before trying again.", false, true);
+      return;
+    }
+    File apk = updateApk();
+    if (!apk.isFile() || apk.length() == 0) {
+      editor.setUpdateState("Check for and download the latest signed release.", false);
+      return;
+    }
+    UPDATE_EXECUTOR.execute(() -> {
+      String message;
+      boolean ready;
+      try {
+        UpdateInstaller.validate(getApplicationContext(), apk);
+        ready = true;
+        message = "The latest update is downloaded and ready to install.";
+      } catch (Exception invalid) {
+        ready = false;
+        message = invalid.getMessage() == null ? "Download the latest signed release." : invalid.getMessage();
+      }
+      final String status = message;
+      final boolean installable = ready;
+      UPDATE_HANDLER.post(() -> {
+        MainActivity current = updateActivity;
+        if (current != null && current.editor != null && !current.isDestroyed()
+            && !UPDATE_DOWNLOADING.get() && !UPDATE_INSTALLING.get())
+          current.editor.setUpdateState(status, installable);
+      });
+    });
+  }
+
+  private void startUpdateDownload() {
+    if (UPDATE_INSTALLING.get()) {
+      if (editor != null) editor.setUpdateState("Android is processing the update. Finish or cancel the installer before trying again.", false, true);
+      return;
+    }
+    if (!UPDATE_DOWNLOADING.compareAndSet(false, true)) {
+      if (editor != null) editor.setUpdateState("The update download is already in progress.", false, true);
+      return;
+    }
+    if (editor != null) editor.setUpdateState("Downloading the latest update…", false, true);
+    final Context app = getApplicationContext();
+    final File destination = updateApk();
+    UPDATE_EXECUTOR.execute(() -> {
+      String status;
+      boolean ready = false;
+      try {
+        LocalBoard.downloadUpdate(app, destination);
+        UpdateInstaller.validate(app, destination);
+        ready = true;
+        status = "The latest update is downloaded and ready to install.";
+      } catch (Exception failure) {
+        status = failure.getMessage() == null ? "The update could not be downloaded. Try again." : failure.getMessage();
+      } finally {
+        UPDATE_DOWNLOADING.set(false);
+      }
+      final String message = status;
+      final boolean installable = ready;
+      UPDATE_HANDLER.post(() -> {
+        MainActivity current = updateActivity;
+        if (current != null && current.editor != null && !current.isDestroyed())
+          current.editor.setUpdateState(message, installable);
+      });
+    });
+  }
+
+  private void beginUpdateInstall() {
+    if (UPDATE_DOWNLOADING.get()) {
+      if (editor != null) editor.setUpdateState("Wait for the download to finish before installing.", false, true);
+      return;
+    }
+    if (android.os.Build.VERSION.SDK_INT < 26
+        && android.provider.Settings.Secure.getInt(getContentResolver(),
+            Settings.Secure.INSTALL_NON_MARKET_APPS, 0) == 0) {
+      try {
+        startActivity(new Intent(Settings.ACTION_SECURITY_SETTINGS));
+        if (editor != null) editor.setUpdateState(
+            "Enable Settings → Security → Unknown sources, return here, then tap Install update.", true);
+      } catch (Exception unavailable) {
+        if (editor != null) editor.setUpdateState(
+            "Enable Settings → Security → Unknown sources, then return and tap Install update.", true);
+      }
+      return;
+    }
+    final File apk = updateApk();
+    if (android.os.Build.VERSION.SDK_INT >= 26 && !getPackageManager().canRequestPackageInstalls()) {
+      try {
+        Intent permission = new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+            Uri.parse("package:" + getPackageName()));
+        startActivity(permission);
+        if (editor != null) editor.setUpdateState("Allow Subway Board to install updates, return here, then tap Install update.", true);
+      } catch (Exception unavailable) {
+        if (editor != null) editor.setUpdateState("Open Android Settings and allow installs from Subway Board, then return and tap Install update.", true);
+      }
+      return;
+    }
+    if (!UPDATE_INSTALLING.compareAndSet(false, true)) {
+      if (editor != null) editor.setUpdateState("Android is already processing this update.", false, true);
+      return;
+    }
+    final SettingsScreen target = editor;
+    if (target != null) target.setUpdateState("Preparing Android's installer…", false, true);
+    final Context app = getApplicationContext();
+    UPDATE_EXECUTOR.execute(() -> {
+      String error = null;
+      try {
+        UpdateInstaller.install(app, apk, apk.length());
+      } catch (Exception failure) {
+        error = failure.getMessage() == null ? "The update could not be prepared. Try again." : failure.getMessage();
+        UPDATE_INSTALLING.set(false);
+      }
+      final String message = error;
+      UPDATE_HANDLER.post(() -> {
+        MainActivity current = updateActivity;
+        if (current == null || current.editor == null || current.isDestroyed()) return;
+        if (message == null) current.editor.setUpdateState("Android's installer is ready. Follow its prompts to finish.", false, true);
+        else current.editor.setUpdateState(message, true, false);
+      });
+    });
   }
 
   private void refreshCatalog(String server, boolean automatic) {

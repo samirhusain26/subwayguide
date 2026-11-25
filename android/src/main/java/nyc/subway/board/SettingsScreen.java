@@ -2,13 +2,11 @@ package nyc.subway.board;
 
 import android.app.AlertDialog;
 import android.app.TimePickerDialog;
-import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Canvas;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.net.Uri;
 import android.provider.Settings;
 import android.text.Editable;
 import android.text.InputType;
@@ -39,13 +37,15 @@ public final class SettingsScreen extends LinearLayout {
     void loadStations(String server);
 
     void changeSource(String server);
+
+    void downloadUpdate();
+
+    void installUpdate();
   }
 
   private static final int PAPER = 0xfff6f6f4, INK = 0xff101010, MUTED = 0xff515459;
   private static final int SOFT = 0xffe5e6e4, WHITE = 0xffffffff;
   private static final String[] TABS = {"Trip", "Display", "Sound", "Connection"};
-  private static final Uri UPDATE_APK = Uri.parse(
-      "https://github.com/samirhusain26/subwayguide/releases/latest/download/SubwayBoard.apk");
   private final Listener listener;
   private final JSONObject draft;
   private JSONArray catalog;
@@ -54,6 +54,9 @@ public final class SettingsScreen extends LinearLayout {
   private int section;
   private EditText serverInput;
   private boolean usePhone;
+  private String updateStatus = "Check for and download the latest signed release.";
+  private boolean updateReady;
+  private boolean updateBusy;
 
   public SettingsScreen(
       Context context, JSONArray stations, JSONObject current, Listener listener) {
@@ -152,7 +155,12 @@ public final class SettingsScreen extends LinearLayout {
       item.setGravity(Gravity.LEFT | Gravity.CENTER_VERTICAL);
       nav.addView(item, new LayoutParams(-1, dp(48)));
     }
-    nav.addView(control("Update app", INK, WHITE, this::openUpdate), new LayoutParams(-1, dp(48)));
+    nav.addView(control("Update app", INK, WHITE, () -> select(4)), new LayoutParams(-1, dp(48)));
+    if (section == 4) {
+      updatePage();
+      scroll.scrollTo(0, 0);
+      return;
+    }
     TextView title = label(TABS[section], 29, INK, true);
     View rule = new View(getContext());
     rule.setBackgroundColor(INK);
@@ -175,13 +183,30 @@ public final class SettingsScreen extends LinearLayout {
     scroll.scrollTo(0, 0);
   }
 
-  private void openUpdate() {
-    try {
-      getContext().startActivity(new Intent(Intent.ACTION_VIEW, UPDATE_APK));
-    } catch (ActivityNotFoundException e) {
-      Toast.makeText(getContext(), "Open the Subway Board download link on a phone with a browser.",
-          Toast.LENGTH_LONG).show();
-    }
+  void setUpdateState(String status, boolean ready) {
+    setUpdateState(status, ready, false);
+  }
+
+  void setUpdateState(String status, boolean ready, boolean busy) {
+    updateStatus = status;
+    updateReady = ready;
+    updateBusy = busy;
+    if (section == 4) draw();
+  }
+
+  private void updatePage() {
+    View rule = new View(getContext());
+    rule.setBackgroundColor(INK);
+    body.addView(rule, new LayoutParams(-1, dp(3)));
+    body.addView(label("Update app", 29, INK, true));
+    note(updateStatus);
+    if (!updateBusy) action(updateReady ? "Install update" : "Download latest update", () -> {
+        if (updateReady) listener.installUpdate();
+        else listener.downloadUpdate();
+      });
+    if (updateReady) note("The Android installer will ask you to confirm the update.");
+    if (android.os.Build.VERSION.SDK_INT < 26)
+      note("Android 5.1: if Android blocks installation, open Settings → Security → Unknown sources, enable it, then try again.");
   }
 
   private void trip() {

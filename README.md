@@ -14,7 +14,9 @@ A landscape home screen that turns a Moto G (3rd generation) into a subway depar
 
 ## Update the app
 
-Open the gear menu and tap **Update app**. Open the downloaded APK and confirm the Android installation prompt. The button always downloads the latest published version, even if it is already installed. An in-place update keeps your saved trip and preferences. If your installed version predates the button, use the download link above once.
+From version 1.3.1, open **Settings → Update app → Download latest update**. When the download is ready, tap **Install update**, then confirm **Install** on Android’s screen. If you leave the page, return to **Update app** to find the downloaded update. Installing over the existing app keeps your trip and preferences.
+
+**Coming from 1.3.0 or earlier?** Install 1.3.1 manually once. Open the completed download notification, or open the Moto’s **Downloads** app and tap the latest `SubwayBoard.apk`. If Chrome shows a certificate or privacy warning, download the APK on a computer you trust and copy it to the phone’s **Download** folder over USB. On Android 5.1, if installation is blocked, enable **Settings → Security → Unknown sources**, tap the APK again, and turn the setting back off after installation.
 
 ## Reading the board
 

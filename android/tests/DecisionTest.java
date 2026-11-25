@@ -63,6 +63,19 @@ public final class DecisionTest {
         && branching.alternateLeaveSeconds == 600, "use the next proven distinct train");
     check("Far Rockaway".equals(branching.targetDestination)
         && "Ozone Park".equals(branching.followingDestination), "keep branch destinations");
+    Decision routes = Decision.evaluate(now, now, "ok", Arrays.asList(
+        new Decision.Train("train-n", now + 780, "Astoria", "N", ""),
+        new Decision.Train("train-w", now + 1260, "Bay Ridge", "W", "")), 10, 1);
+    check("N".equals(routes.targetRoute) && "W".equals(routes.followingRoute),
+        "keep actual line identity for both opportunities");
+    Decision priorLine = Decision.evaluate(now, now, "ok",
+        Collections.singletonList(new Decision.Train("same-id", now + 900, "Astoria", "N", "")),
+        10, 0);
+    Decision changedLine = Decision.evaluate(now, now, "ok",
+        Collections.singletonList(new Decision.Train("same-id", now + 780, "Bay Ridge", "W", "")),
+        10, 0);
+    check(ChimePolicy.crossing(priorLine, changedLine) == 0,
+        "route identity change cannot reuse another line's train chime identity");
     Decision tied = Decision.evaluate(now, now, "ok", Arrays.asList(
         new Decision.Train("b", now + 630, "Ozone Park"),
         new Decision.Train("a", now + 630, "Far Rockaway")), 10, 0);

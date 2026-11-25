@@ -76,7 +76,7 @@ The APK includes the native Android board, the station catalog and an embedded P
 ```sh
 ~/.local/bin/dev-storage run -- ./android/build.sh
 ~/.local/bin/dev-storage run -- uv run --python 3.11 --with-requirements server/requirements.txt python -m unittest discover -s server
-~/.local/bin/dev-storage run -- bash -c 'javac -d "$TMPDIR" android/src/main/java/nyc/subway/board/{Decision,ChimePolicy}.java android/tests/*.java && java -ea -cp "$TMPDIR" nyc.subway.board.DecisionTest && java -ea -cp "$TMPDIR" nyc.subway.board.ChimePolicyTest'
+~/.local/bin/dev-storage run -- bash -ec 'javac -d "$TMPDIR" android/src/main/java/nyc/subway/board/{Decision,ChimePolicy,MultiRoutePolicy}.java android/tests/*.java; for suite in DecisionTest ChimePolicyTest MultiRoutePolicyTest; do java -ea -cp "$TMPDIR" nyc.subway.board.$suite; done'
 ```
 
 For future releases, increase `versionCode` and update `versionName` in `android/app/build.gradle`, then build with the original signing key. Compare the signing certificate to the previous release with `apksigner verify --print-certs`. Publish a GitHub Release for the tested commit, attach `dist/SubwayBoard.apk` with the filename **SubwayBoard.apk**, and mark the release as latest. The same Settings button will pick it up.

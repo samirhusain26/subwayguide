@@ -7,6 +7,7 @@ public final class ChimePolicy {
   public static int crossing(Decision previous, Decision current) {
     if (previous == null || current == null || !previous.live || !current.live
         || current.targetId == null || !current.targetId.equals(previous.targetId)
+        || !current.targetRoute.equals(previous.targetRoute)
         || current.leaveSeconds <= 0) return 0;
     // On an ETA revision across both thresholds, only the more urgent cue is relevant.
     for (int threshold : THRESHOLDS) {

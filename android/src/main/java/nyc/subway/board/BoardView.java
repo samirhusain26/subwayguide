@@ -100,12 +100,13 @@ public final class BoardView extends FrameLayout {
       String stationId, String station, String route, String side, String direction,
       String headline, String detail, String next, String weatherKind, String weather, String alert,
       boolean reduceMotion, Decision guidance, long now) {
-    String selected = stationId + "/" + route + "/" + side;
+    String selected = stationId + "/" + route + "/" + side + "/" + direction;
     boolean newSelection = !selection.equals(selected);
     boolean hadTarget = hasTarget(this.guidance);
     boolean hasTarget = hasTarget(guidance);
     boolean targetChanged = hadTarget && hasTarget && !newSelection
         && (!java.util.Objects.equals(this.guidance.targetId, guidance.targetId)
+            || !this.guidance.targetRoute.equals(guidance.targetRoute)
             || this.guidance.leaveNow != guidance.leaveNow);
     String destination = hasTarget ? guidance.targetDestination : "";
     String actualRoute = hasTarget && !guidance.primary.route.isEmpty() ? guidance.primary.route : route;
@@ -120,7 +121,7 @@ public final class BoardView extends FrameLayout {
     }
     this.selection = selected;
     this.station = station;
-    this.route = route;
+    this.route = actualRoute;
     this.direction = direction;
     this.headline = headline;
     this.detail = detail;
@@ -129,14 +130,15 @@ public final class BoardView extends FrameLayout {
     this.alert = alert;
     this.guidance = guidance;
     this.now = now;
-    String description = station + ", " + displayRoute(route)
-        + (isExpress(route) ? " express" : "") + " " + direction + ". " + headline + ". " + detail
+    String description = station + ", " + displayRoute(actualRoute)
+        + (isExpress(actualRoute) ? " express" : "") + " " + direction + ". " + headline + ". " + detail
         + (next.isEmpty() ? "" : ". Platform arrivals: " + next.replace("\n", "; "))
         + (weather.isEmpty() ? "" : ". Forecast: " + weather)
         + (alert.isEmpty() ? "" : ". Service notice: " + alert);
     description += ". " + map.description();
     if (hasTarget && guidance.followingTime > 0) {
       description += ". " + alternateCue() + ". Following train in " + eta(guidance.followingTime)
+          + (guidance.followingRoute.isEmpty() ? "" : " on " + routeName(guidance.followingRoute))
           + (guidance.followingDestination.isEmpty() ? "" : ", " + guidance.followingDestination);
     }
     if (!description.contentEquals(spokenBoard.getContentDescription() == null
@@ -282,23 +284,31 @@ public final class BoardView extends FrameLayout {
   }
 
   private void drawOpportunities(Canvas canvas) {
-    arrival(canvas, 306, guidance.targetTime, guidance.targetDestination, true);
+    arrival(canvas, 306, guidance.targetTime, guidance.targetDestination, guidance.targetRoute, true);
     if (guidance.followingTime > 0)
-      arrival(canvas, 477, guidance.followingTime, guidance.followingDestination, false);
+      arrival(canvas, 477, guidance.followingTime, guidance.followingDestination, guidance.followingRoute, false);
   }
 
-  private void arrival(Canvas canvas, float x, long time, String destination, boolean primary) {
-    int color = routeColor(route);
+  private void arrival(Canvas canvas, float x, long time, String destination, String serviceRoute, boolean primary) {
+    int color = routeColor(serviceRoute.isEmpty() ? route : serviceRoute);
     fill(color);
     canvas.drawCircle(x + 8, 270, 5, paint);
     if (!primary) {
       fill(PAPER);
       canvas.drawCircle(x + 8, 270, 3, paint);
     }
-    text(primary ? "Target train" : "Following train", x + 19, 274, 13, MEDIUM, MUTED,
-        Paint.Align.LEFT, canvas);
+    fitted((primary ? "Target" : "Following") + " · " + routeName(serviceRoute.isEmpty() ? route : serviceRoute),
+        x + 19, 274, 13, 11, 134, MEDIUM, MUTED, canvas);
     fitted(eta(time), x + 2, 299, 23, 15, 153, HEAVY, INK, canvas);
     fitted(destination, x + 2, 317, 13, 11, 153, NORMAL, MUTED, canvas);
+  }
+
+  static String routeName(String value) {
+    if ("GS".equals(value)) return "42 St Shuttle";
+    if ("FS".equals(value)) return "Franklin Shuttle";
+    if ("H".equals(value)) return "Rockaway Shuttle";
+    if ("SI".equals(value)) return "SIR";
+    return value;
   }
 
   private void drawWeatherIcon(Canvas canvas) {

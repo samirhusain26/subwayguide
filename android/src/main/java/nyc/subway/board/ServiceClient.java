@@ -36,11 +36,15 @@ final class ServiceClient {
   }
 
   static JSONObject board(JSONObject config) throws Exception {
+    return board(config, config.getString("route"));
+  }
+
+  static JSONObject board(JSONObject config, String route) throws Exception {
     String path =
         new Uri.Builder()
             .path("/v1/board")
             .appendQueryParameter("station", config.getString("station"))
-            .appendQueryParameter("route", config.getString("route"))
+            .appendQueryParameter("route", route)
             .appendQueryParameter("direction", config.getString("direction"))
             .build()
             .toString();

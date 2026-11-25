@@ -17,8 +17,12 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.*;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -189,11 +193,12 @@ public final class SettingsScreen extends LinearLayout {
             : station.optString("name") + "  ·  " + station.optString("line", station.optString("area"));
     action(stationLabel + "   ›", this::stationPicker);
     if (station != null) {
-      heading("Line");
-      choices(station.optJSONArray("routes"), draft.optString("route"), true, station);
+      heading("Lines");
+      choices(station.optJSONArray("routes"), "", true, station);
+      note("Choose one or more lines. Disabled lines do not board in the chosen direction.");
       heading("Direction");
       choices(
-          directions(station, draft.optString("route")),
+          boardingDirections(station),
           draft.optString("direction"),
           false,
           station);
@@ -227,19 +232,103 @@ public final class SettingsScreen extends LinearLayout {
     return false;
   }
 
-  private String routeLabel(String route) {
-    if (route.equals("GS")) return "42 St Shuttle";
-    if (route.equals("FS")) return "Franklin Shuttle";
-    if (route.equals("H")) return "Rockaway Shuttle";
-    return route.equals("SI") ? "SIR" : route;
-  }
-
   private void choose(JSONObject station, String route) {
     put("station", station.optString("id"));
-    put("route", route);
-    JSONArray dirs = directions(station, route);
-    if (!contains(dirs, draft.optString("direction"))) put("direction", dirs.optString(0, ""));
+    JSONArray routes = selectedRoutes();
+    if (contains(routes, route)) {
+      JSONArray kept = new JSONArray();
+      for (int i = 0; i < routes.length(); i++)
+        if (!route.equals(routes.optString(i))) kept.put(routes.optString(i));
+      routes = kept;
+    } else {
+      if (!contains(directions(station, route), draft.optString("direction"))) return;
+      routes.put(route);
+    }
+    JSONArray compatible = compatibleRoutes(station, routes, draft.optString("direction"));
+    put("routes", compatible);
+    put("route", compatible.optString(0, ""));
     draw();
+  }
+
+  private void chooseStation(JSONObject station) {
+    put("station", station.optString("id"));
+    JSONArray offered = station.optJSONArray("routes");
+    JSONArray selected = selectedRoutes();
+    JSONArray compatible = compatibleRoutes(station, selected, draft.optString("direction"));
+    JSONArray onStation = new JSONArray();
+    for (int i = 0; i < compatible.length(); i++)
+      if (contains(offered, compatible.optString(i))) onStation.put(compatible.optString(i));
+    compatible = onStation;
+    if (compatible.length() == 0) {
+      String route = "";
+      for (int i = 0; offered != null && i < offered.length(); i++) {
+        String candidate = offered.optString(i);
+        if (contains(directions(station, candidate), draft.optString("direction"))) {
+          route = candidate;
+          break;
+        }
+      }
+      if (route.isEmpty() && offered != null && offered.length() > 0) {
+        route = offered.optString(0);
+        put("direction", directions(station, route).optString(0, ""));
+      }
+      if (!route.isEmpty()) {
+        compatible.put(route);
+      }
+    }
+    put("routes", compatible);
+    put("route", compatible.optString(0, ""));
+    draw();
+  }
+
+  private JSONArray selectedRoutes() {
+    JSONArray routes = draft.optJSONArray("routes");
+    if (routes != null) {
+      JSONArray copy = new JSONArray();
+      for (int i = 0; i < routes.length(); i++) copy.put(routes.optString(i));
+      return copy;
+    }
+    JSONArray legacy = new JSONArray();
+    String route = draft.optString("route");
+    if (!route.isEmpty()) legacy.put(route);
+    return legacy;
+  }
+
+  private JSONArray boardingDirections(JSONObject station) {
+    JSONArray result = new JSONArray();
+    String[] sides = {"N", "S"};
+    for (String side : sides) {
+      JSONArray routes = station.optJSONArray("routes");
+      for (int i = 0; routes != null && i < routes.length(); i++)
+        if (contains(directions(station, routes.optString(i)), side)) {
+          result.put(side);
+          break;
+        }
+    }
+    return result;
+  }
+
+  private JSONArray compatibleRoutes(JSONObject station, JSONArray selected, String direction) {
+    List<String> requested = new ArrayList<>();
+    for (int i = 0; selected != null && i < selected.length(); i++)
+      requested.add(selected.optString(i));
+    Map<String, Set<String>> byRoute = new LinkedHashMap<>();
+    JSONObject routeDirections = station.optJSONObject("routeDirections");
+    if (routeDirections != null) {
+      java.util.Iterator<String> routes = routeDirections.keys();
+      while (routes.hasNext()) {
+        String route = routes.next();
+        JSONArray values = routeDirections.optJSONArray(route);
+        Set<String> directions = new LinkedHashSet<>();
+        for (int i = 0; values != null && i < values.length(); i++)
+          directions.add(values.optString(i));
+        byRoute.put(route, directions);
+      }
+    }
+    JSONArray result = new JSONArray();
+    for (String route : MultiRoutePolicy.compatibleRoutes(requested, byRoute, direction))
+      result.put(route);
+    return result;
   }
 
   private void choices(JSONArray items, String active, boolean routes, JSONObject station) {
@@ -255,11 +344,14 @@ public final class SettingsScreen extends LinearLayout {
     for (int i = 0; i < items.length(); i++) {
       String value = items.optString(i);
       String title =
-          routes ? routeLabel(value) : station.optJSONObject("directions").optString(value, value);
-      boolean chosen = active.equals(value);
+          routes ? BoardView.routeName(value) : station.optJSONObject("directions").optString(value, value);
+      boolean chosen = routes ? contains(selectedRoutes(), value) : active.equals(value);
       Runnable selectChoice = () -> {
         if (routes) choose(station, value);
         else {
+          JSONArray compatible = compatibleRoutes(station, selectedRoutes(), value);
+          put("routes", compatible);
+          put("route", compatible.optString(0, ""));
           put("direction", value);
           draw();
         }
@@ -271,7 +363,14 @@ public final class SettingsScreen extends LinearLayout {
               chosen ? WHITE : INK,
               selectChoice);
       button.setSelected(chosen);
-      button.setContentDescription(title + (chosen ? ", selected" : ""));
+      boolean directionAvailable = !routes
+          || contains(directions(station, value), draft.optString("direction"));
+      if (!directionAvailable) {
+        button.setEnabled(false);
+        button.setAlpha(.4f);
+      }
+      button.setContentDescription(title + (chosen ? ", selected" : "")
+          + (directionAvailable ? "" : ", unavailable in selected direction"));
       LayoutParams params = new LayoutParams(-2, dp(48));
       params.rightMargin = dp(5);
       strip.addView(button, params);
@@ -330,7 +429,7 @@ public final class SettingsScreen extends LinearLayout {
             if (routes == null || routes.length() == 0) continue;
             for (int j = 0; j < routes.length(); j++) {
               if (j > 0) lines.append(" ");
-              lines.append(routeLabel(routes.optString(j)));
+              lines.append(BoardView.routeName(routes.optString(j)));
             }
             String name =
                 station.optString("name")
@@ -373,10 +472,8 @@ public final class SettingsScreen extends LinearLayout {
         (parent, v, index, id) -> {
           if (index >= matches.size()) return;
           JSONObject s = matches.get(index);
-          JSONArray routes = s.optJSONArray("routes");
-          String route = draft.optString("route");
           dlg.dismiss();
-          choose(s, contains(routes, route) ? route : routes.optString(0));
+          chooseStation(s);
         });
     dlg.show();
     dlg.getWindow()
@@ -508,9 +605,13 @@ public final class SettingsScreen extends LinearLayout {
       return;
     }
     JSONObject station = selected();
+    JSONArray routes = station == null ? null : selectedRoutes();
+    boolean valid = station != null && routes != null && routes.length() > 0;
+    for (int i = 0; valid && i < routes.length(); i++)
+      valid = contains(station.optJSONArray("routes"), routes.optString(i))
+          && contains(directions(station, routes.optString(i)), draft.optString("direction"));
     if (station == null
-        || !contains(station.optJSONArray("routes"), draft.optString("route"))
-        || !contains(directions(station, draft.optString("route")), draft.optString("direction"))) {
+        || !valid) {
       select(0);
       Toast.makeText(
               getContext(), "Choose a station, line and boarding direction.", Toast.LENGTH_LONG)

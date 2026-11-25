@@ -391,7 +391,7 @@ public class HostUiTest {
     named(s, "Reduce motion     Off").performClick();
     named(s, "Save").performClick();
     assertEquals("A24", saved[0].getString("station"));
-    assertEquals("C", saved[0].getString("route"));
+    assertEquals("[\"A\",\"C\"]", saved[0].getJSONArray("routes").toString());
     assertEquals("N", saved[0].getString("direction"));
     assertEquals(11, saved[0].getInt("walk"));
     assertEquals(63, saved[0].getInt("days"));
@@ -404,6 +404,7 @@ public class HostUiTest {
     SettingsScreen reopened = new SettingsScreen(activity, catalog(), saved[0], listener);
     show(reopened);
     assertTrue(named(reopened, "Uptown, selected").isSelected());
+    assertTrue(named(reopened, "A, selected").isSelected());
     assertTrue(named(reopened, "C, selected").isSelected());
     named(reopened, "‹   Cancel").performClick();
     assertTrue(canceled);

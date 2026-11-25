@@ -28,7 +28,7 @@ import org.json.JSONObject;
 public final class MainActivity extends Activity {
   private final Handler handler = new Handler();
   private final ExecutorService network = Executors.newFixedThreadPool(2);
-  private final List<Decision.Train> trains = new ArrayList<>();
+  private final List<RouteSnapshot> routeSnapshots = new ArrayList<>();
   private SharedPreferences prefs;
   private JSONObject config;
   private JSONArray stations, bundled, testedCatalog;
@@ -42,6 +42,17 @@ public final class MainActivity extends Activity {
   private int generation, catalogRequest, failures;
   private boolean resumed, pending, disconnected, invalidSelection, invalidData;
 
+  private static final class RouteSnapshot {
+    final String route;
+    final JSONObject payload;
+    final long requestStarted;
+    RouteSnapshot(String route, JSONObject payload, long requestStarted) {
+      this.route = route;
+      this.payload = payload;
+      this.requestStarted = requestStarted;
+    }
+  }
+
   @Override
   public void onCreate(Bundle state) {
     super.onCreate(state);
@@ -54,6 +65,7 @@ public final class MainActivity extends Activity {
         String key = keys.next();
         if (saved.has(key)) config.put(key, saved.get(key));
       }
+      if (!saved.has("routes")) config.put("routes", new JSONArray().put(config.optString("route", "1")));
     } catch (JSONException ignored) {
       /* Safe defaults recover invalid old data. */
     }
@@ -112,6 +124,7 @@ public final class MainActivity extends Activity {
       c.put("server", "")
           .put("station", "116")
           .put("route", "1")
+          .put("routes", new JSONArray().put("1"))
           .put("direction", "S")
           .put("walk", 10)
           .put("buffer", 0)
@@ -178,7 +191,7 @@ public final class MainActivity extends Activity {
     invalidSelection = false;
     invalidData = false;
     failures = 0;
-    trains.clear();
+    routeSnapshots.clear();
     nextRequest = 0;
     handler.removeCallbacks(tick);
     if (resumed && editor == null) tick.run();
@@ -200,64 +213,56 @@ public final class MainActivity extends Activity {
   private void fetchBoard() {
     final int request = generation;
     final JSONObject selection = config;
-    final long requestedAt = SystemClock.elapsedRealtime();
     pending = true;
     network.execute(
         () -> {
-          JSONObject result = null;
+          List<RouteSnapshot> snapshots = new ArrayList<>();
           boolean badSelection = false;
           boolean malformed = false;
-          try {
-            JSONObject payload = selection.optString("server").isEmpty()
-                ? LocalBoard.board(getApplicationContext(), selection.getString("station"),
-                    selection.getString("route"), selection.getString("direction"))
-                : ServiceClient.board(selection);
-            validateBoard(payload);
-            result = payload;
-          } catch (JSONException e) {
-            malformed = true;
-          } catch (ServiceClient.UnknownSelection e) {
-            badSelection = true;
-          } catch (Exception | LinkageError ignored) {
-            /* The next poll will retry. */
+          JSONArray selectedRoutes = selectedRoutes(selection);
+          for (int i = 0; i < selectedRoutes.length(); i++) {
+            String route = selectedRoutes.optString(i);
+            try {
+              long requestStarted = SystemClock.elapsedRealtime();
+              JSONObject payload = selection.optString("server").isEmpty()
+                  ? LocalBoard.board(getApplicationContext(), selection.getString("station"),
+                      route, selection.getString("direction"))
+                  : ServiceClient.board(selection, route);
+              validateBoard(payload);
+              snapshots.add(new RouteSnapshot(route, payload, requestStarted));
+            } catch (JSONException e) {
+              malformed = true;
+            } catch (ServiceClient.UnknownSelection e) {
+              badSelection = true;
+            } catch (Exception | LinkageError ignored) {
+              // One route can be offline while another route still has safe live predictions.
+            }
           }
-          final boolean invalid = badSelection;
-          final boolean invalidPayload = malformed;
-          final JSONObject snapshot = result;
+          final boolean invalid = badSelection && snapshots.isEmpty();
+          final boolean invalidPayload = malformed && snapshots.isEmpty();
+          final List<RouteSnapshot> received = snapshots;
           handler.post(
               () -> {
                 if (request != generation || !resumed) return;
                 pending = false;
                 invalidSelection = invalid;
                 invalidData = invalidPayload;
-                disconnected = snapshot == null;
+                disconnected = received.isEmpty();
                 if (disconnected) {
                   previous = null;
                   failures = Math.min(failures + 1, 4);
                 } else {
                   if (failures > 0) previous = null;
                   failures = 0;
-                  response = snapshot;
-                  // The embedded server shares Android's wall clock. For a remote clock,
-                  // charge the full round trip so an old prediction never gains extra life.
+                  routeSnapshots.clear();
+                  routeSnapshots.addAll(received);
+                  response = received.get(0).payload;
                   if (selection.optString("server").isEmpty()) {
                     referenceTime = System.currentTimeMillis() / 1000;
                     receivedAt = SystemClock.elapsedRealtime();
                   } else {
-                    referenceTime = snapshot.optLong("serverTime");
-                    receivedAt = requestedAt;
-                  }
-                  trains.clear();
-                  JSONArray items = snapshot.optJSONArray("arrivals");
-                  for (int i = 0; items != null && i < items.length(); i++) {
-                    JSONObject train = items.optJSONObject(i);
-                    if (train != null && train.optLong("time") > 0)
-                      trains.add(
-                          new Decision.Train(
-                              train.opt("id") instanceof String ? train.optString("id") : "",
-                              train.optLong("time"),
-                              train.isNull("destination") ? "" : train.optString("destination"),
-                              train.optString("route"), train.optString("onward")));
+                    referenceTime = response.optLong("serverTime");
+                    receivedAt = received.get(0).requestStarted;
                   }
                 }
                 long retryMs = failures == 0 ? 15000 : Math.min(60000, 5000L << (failures - 1));
@@ -281,6 +286,93 @@ public final class MainActivity extends Activity {
     }
   }
 
+  private static JSONArray selectedRoutes(JSONObject settings) {
+    JSONArray routes = settings.optJSONArray("routes");
+    if (routes != null && routes.length() > 0) return routes;
+    JSONArray legacy = new JSONArray();
+    if (!settings.optString("route").isEmpty()) legacy.put(settings.optString("route"));
+    return legacy;
+  }
+
+  private List<Decision.Train> trainsFor(long now, boolean adviceOnly) {
+    List<Decision.Train> result = new ArrayList<>();
+    Set<String> identities = new HashSet<>();
+    List<String> selected = new ArrayList<>();
+    JSONArray selectedArray = selectedRoutes(config);
+    for (int i = 0; i < selectedArray.length(); i++) selected.add(selectedArray.optString(i));
+    for (RouteSnapshot snapshot : routeSnapshots) {
+      JSONObject payload = snapshot.payload;
+      String status = payload.optString("status");
+      if (!MultiRoutePolicy.fresh(now, payload.optLong("feedTime"), status)
+          || "disrupted".equals(status)
+          || (adviceOnly && !payload.optBoolean("noticesReady", false))) continue;
+      JSONArray arrivals = payload.optJSONArray("arrivals");
+      for (int i = 0; arrivals != null && i < arrivals.length(); i++) {
+        JSONObject train = arrivals.optJSONObject(i);
+        if (train == null || train.optLong("time") <= 0) continue;
+        String rawId = train.opt("id") instanceof String ? train.optString("id") : "";
+        String actualRoute = train.isNull("route") ? "" : train.optString("route", "");
+        if (actualRoute.isEmpty()) actualRoute = snapshot.route;
+        if (!MultiRoutePolicy.snapshotMaySupplyTrain(selected, snapshot.route, actualRoute)) continue;
+        String key = MultiRoutePolicy.identityKey(actualRoute, rawId);
+        if (!rawId.trim().isEmpty() && !identities.add(key)) continue;
+        result.add(new Decision.Train(rawId, train.optLong("time"),
+            train.isNull("destination") ? "" : train.optString("destination"),
+            actualRoute, train.optString("onward")));
+      }
+    }
+    return result;
+  }
+
+  private boolean hasFreshRoute(long now) {
+    for (RouteSnapshot snapshot : routeSnapshots)
+      if (MultiRoutePolicy.fresh(now, snapshot.payload.optLong("feedTime"),
+          snapshot.payload.optString("status"))) return true;
+    return false;
+  }
+
+  private boolean hasSafeRoute(long now) {
+    for (RouteSnapshot snapshot : routeSnapshots) {
+      JSONObject payload = snapshot.payload;
+      if (MultiRoutePolicy.fresh(now, payload.optLong("feedTime"), payload.optString("status"))
+          && payload.optBoolean("noticesReady", false)) return true;
+    }
+    return false;
+  }
+
+  private String combinedAlert() {
+    StringBuilder value = new StringBuilder();
+    Set<String> seen = new HashSet<>();
+    for (RouteSnapshot snapshot : routeSnapshots) {
+      if (snapshot.payload.isNull("alert")) continue;
+      String alert = snapshot.payload.optString("alert").trim();
+      if (!alert.isEmpty() && seen.add(alert)) {
+        if (value.length() > 0) value.append(" · ");
+        value.append(alert);
+      }
+    }
+    return value.toString();
+  }
+
+  private boolean allRoutesDisrupted() {
+    JSONArray selected = selectedRoutes(config);
+    if (routeSnapshots.isEmpty() || routeSnapshots.size() != selected.length()) return false;
+    for (RouteSnapshot snapshot : routeSnapshots)
+      if (!"disrupted".equals(snapshot.payload.optString("status"))) return false;
+    return true;
+  }
+
+  private boolean routesIncomplete(long now) {
+    JSONArray selected = selectedRoutes(config);
+    if (routeSnapshots.size() < selected.length()) return true;
+    for (RouteSnapshot snapshot : routeSnapshots) {
+      String status = snapshot.payload.optString("status");
+      if ("disrupted".equals(status)) continue;
+      if (!MultiRoutePolicy.fresh(now, snapshot.payload.optLong("feedTime"), status)) return true;
+    }
+    return false;
+  }
+
   private JSONObject station() {
     String id = config.optString("station");
     for (int i = 0; i < stations.length(); i++) {
@@ -296,6 +388,15 @@ public final class MainActivity extends Activity {
     String name = s.optString("name", config.optString("station"));
     JSONObject labels = s.optJSONObject("directions");
     String direction = labels == null ? side : labels.optString(side, side);
+    JSONArray lines = selectedRoutes(config);
+    if (lines.length() > 1) {
+      StringBuilder subtitle = new StringBuilder(direction).append(" · ");
+      for (int i = 0; i < lines.length(); i++) {
+        if (i > 0) subtitle.append(" / ");
+        subtitle.append(BoardView.routeName(lines.optString(i)));
+      }
+      direction = subtitle.toString();
+    }
     boolean reduced =
         config.optBoolean("reduceMotion")
             || Settings.Global.getFloat(
@@ -324,17 +425,23 @@ public final class MainActivity extends Activity {
         detail = disconnected ? "Check Wi-Fi and the address in Connection. Trying again automatically."
             : "Connecting to your home server…";
     } else {
+      boolean fresh = hasFreshRoute(now);
+      boolean noticesReady = hasSafeRoute(now);
+      List<Decision.Train> visibleTrains = trainsFor(now, noticesReady);
       Decision d =
           Decision.evaluate(
               now,
-              response.optLong("feedTime", 0),
-              response.optString("status"),
-              trains,
+              fresh ? now : response.optLong("feedTime", 0),
+              fresh ? "ok" : response.optString("status"),
+              visibleTrains,
               config.optInt("walk"),
               config.optInt("buffer"));
       headline = d.headline;
       detail = d.detail;
       next = d.next;
+      boolean incomplete = routesIncomplete(now);
+      if (incomplete && fresh)
+        detail += " Some selected lines have no current data.";
       if (!d.live && response.optLong("feedTime") > 0) {
         java.text.DateFormat format = new java.text.SimpleDateFormat("h:mm a", java.util.Locale.US);
         format.setTimeZone(TimeZone.getTimeZone("America/New_York"));
@@ -343,6 +450,12 @@ public final class MainActivity extends Activity {
                 + format.format(new java.util.Date(response.optLong("feedTime") * 1000L));
       }
       JSONObject forecast = response.optJSONObject("weather");
+      if (forecast == null) {
+        for (RouteSnapshot snapshot : routeSnapshots) {
+          forecast = snapshot.payload.optJSONObject("weather");
+          if (forecast != null) break;
+        }
+      }
       if (forecast != null && now < forecast.optLong("expiresAt", referenceTime + 60)) {
         weatherKind = forecast.optString("kind");
         switch (weatherKind) {
@@ -364,13 +477,12 @@ public final class MainActivity extends Activity {
             weather = Math.round(degrees) + "°" + unit + "  " + weather;
         }
       }
-      if (!response.isNull("alert")) alert = response.optString("alert");
-      if ("disrupted".equals(response.optString("status"))) {
+      alert = combinedAlert();
+      if (!noticesReady && allRoutesDisrupted()) {
         headline = "Service change";
         detail = "Boarding is affected at this platform.";
         next = "";
       }
-      boolean noticesReady = response.optBoolean("noticesReady", false);
       if (d.live && !noticesReady) {
         headline = "Checking service";
         detail = "Waiting for service notices before giving a leave time.";
@@ -392,7 +504,7 @@ public final class MainActivity extends Activity {
     String window = Decision.chimeWindow(now, config.optInt("days"), config.optInt("start"),
         config.optInt("end"));
     if (window == null) return;
-    String target = config.optString("station") + "/" + config.optString("route") + "/"
+    String target = config.optString("station") + "/" + current.targetRoute + "/"
         + config.optString("direction") + "/" + current.targetId;
     boolean sameWindow = window.equals(prefs.getString("lastWindow", ""));
     if (!config.optBoolean("chimeRepeat") && sameWindow
@@ -559,15 +671,21 @@ public final class MainActivity extends Activity {
   }
 
   private static boolean offersTrip(JSONArray directory, JSONObject settings) {
-    String id = settings.optString("station"), route = settings.optString("route");
+    String id = settings.optString("station");
+    JSONArray routes = selectedRoutes(settings);
+    if (routes.length() == 0) return false;
     for (int i = 0; i < directory.length(); i++) {
       JSONObject s = directory.optJSONObject(i);
       if (s == null || !id.equals(s.optString("id"))) continue;
       JSONObject service = s.optJSONObject("routeDirections");
-      JSONArray directions = service == null ? null : service.optJSONArray(route);
-      for (int j = 0; directions != null && j < directions.length(); j++)
-        if (settings.optString("direction").equals(directions.optString(j))) return true;
-      return false;
+      for (int r = 0; r < routes.length(); r++) {
+        JSONArray directions = service == null ? null : service.optJSONArray(routes.optString(r));
+        boolean served = false;
+        for (int j = 0; directions != null && j < directions.length(); j++)
+          served |= settings.optString("direction").equals(directions.optString(j));
+        if (!served) return false;
+      }
+      return true;
     }
     return false;
   }

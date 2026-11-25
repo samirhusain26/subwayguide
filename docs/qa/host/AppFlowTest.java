@@ -38,6 +38,80 @@ public class AppFlowTest {
   private final AtomicReference<String> served = new AtomicReference<>();
 
   @Test
+  public void combinesUnionSquareLinesAndKeepsTheSelectionAfterRestart() throws Exception {
+    AtomicReference<String> mode = new AtomicReference<>("both");
+    java.util.Set<String> requested = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext("/v1/stations",
+        exchange -> write(exchange, Files.readAllBytes(Paths.get(System.getProperty("catalogFile")))));
+    server.createContext("/v1/board", exchange -> {
+      android.net.Uri query = android.net.Uri.parse(exchange.getRequestURI().toString());
+      String route = query.getQueryParameter("route");
+      requested.add(query.getQueryParameter("station") + "/" + route + "/" + query.getQueryParameter("direction"));
+      try {
+        boolean isW = "W".equals(route);
+        boolean suspended = isW && "W suspended".equals(mode.get());
+        org.json.JSONArray arrivals = new org.json.JSONArray();
+        if (!suspended) {
+          if (!isW) arrivals.put(new JSONObject().put("id", "early")
+              .put("time", MORNING + 240).put("route", route));
+          arrivals.put(new JSONObject().put("id", "trip-" + route).put("route", route)
+              .put("destination", isW ? "Whitehall St" : "Coney Island")
+              .put("time", MORNING + (isW ? 805 : 1050)));
+        }
+        long feedTime = isW && "W aging".equals(mode.get()) ? MORNING - 52 : MORNING;
+        JSONObject payload = new JSONObject().put("status", suspended ? "disrupted" : "ok")
+            .put("serverTime", MORNING).put("feedTime", feedTime)
+            .put("noticesReady", true).put("arrivals", arrivals);
+        payload.put("alert", suspended ? "W boarding suspended at Union Square" : JSONObject.NULL);
+        write(exchange, payload.toString().getBytes(StandardCharsets.UTF_8));
+        served.set(mode.get());
+      } catch (org.json.JSONException e) {
+        throw new AssertionError(e);
+      }
+    });
+    server.start();
+    ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class);
+    try {
+      MainActivity app = controller.get();
+      app.setTheme(android.R.style.Theme_Material_NoActionBar);
+      // Begin with preferences from the single-line app.
+      JSONObject oldTrip = new JSONObject().put("station", "R20").put("route", "N")
+          .put("direction", "S").put("server", "http://127.0.0.1:" + server.getAddress().getPort());
+      app.getSharedPreferences("subway-board", MainActivity.MODE_PRIVATE).edit()
+          .putString("settings", oldTrip.toString()).commit();
+      controller.setup();
+      View initial = app.findViewById(android.R.id.content);
+      until(() -> boardSays(initial, "Leave in 7 min"));
+      HostUiTest.named(initial, "Settings").performClick();
+      until(() -> boardSays(initial, "N, selected"));
+      assertTrue(HostUiTest.named(initial, "N, selected").isSelected());
+      HostUiTest.named(initial, "W").performClick();
+      HostUiTest.named(initial, "Save").performClick();
+      until(() -> boardSays(initial, "Leave in 3 min") && boardSays(initial, "Whitehall St"));
+      assertFalse(boardSays(initial, "Service notice: null"));
+      assertEquals(java.util.Set.of("R20/N/S", "R20/W/S"), requested);
+
+      controller.recreate();
+      View reopened = controller.get().findViewById(android.R.id.content);
+      until(() -> boardSays(reopened, "Leave in 3 min") && boardSays(reopened, "Coney Island"));
+      poll(mode, "W suspended", reopened, "Leave in 7 min");
+      assertTrue(boardSays(reopened, "W boarding suspended"));
+      assertFalse(boardSays(reopened, "Whitehall St"));
+      poll(mode, "W aging", reopened, "Leave in 3 min");
+      // Allow a full board tick after the 60-second cutoff, ahead of the 15-second repoll.
+      Shadows.shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(11));
+      BoardView board = HostUiTest.first(reopened, BoardView.class);
+      assertTrue(board.getChildAt(0).getContentDescription().toString(), boardSays(reopened, "Leave in 7 min"));
+      assertFalse(boardSays(reopened, "Whitehall St"));
+      assertEquals(java.util.Set.of("R20/N/S", "R20/W/S"), requested);
+    } finally {
+      controller.pause().stop().destroy();
+      server.stop(0);
+    }
+  }
+
+  @Test
   public void configureServiceAndFollowACommute() throws Exception {
     AtomicReference<String> mode = new AtomicReference<>("initial");
     AtomicReference<String> selection = new AtomicReference<>();

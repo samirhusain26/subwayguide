@@ -1,0 +1,9 @@
+{
+  "_provenance": "Manual semantic direction map cross-checked against ordered platform-stop patterns and terminal destinations in the packaged network.json. The M train reverses platform compass at the shared J/M corridor. Regenerate/review when the packaged GTFS atlas changes.",
+  "M18": {"aliases": {"Inbound": "Manhattan", "Brooklyn": "Brooklyn / Queens"}, "directions": {"Manhattan": {"label": "Bowery / Broadway-Lafayette", "J": "S", "M": "N", "Z": "S"}, "Brooklyn / Queens": {"label": "Brooklyn via Marcy Av", "J": "N", "M": "S", "Z": "N"}}},
+  "M12": {"directions": {"Manhattan": {"label": "Toward Manhattan", "J": "S", "M": "N"}, "Outbound": {"label": "Toward Jamaica / Middle Village", "J": "N", "M": "S"}}},
+  "M14": {"directions": {"Manhattan": {"label": "Toward Manhattan", "J": "S", "M": "N"}, "Outbound": {"label": "Toward Jamaica / Middle Village", "J": "N", "M": "S"}}},
+  "M13": {"directions": {"Manhattan": {"label": "Toward Manhattan", "J": "S", "M": "N"}, "Outbound": {"label": "Toward Jamaica / Middle Village", "J": "N", "M": "S"}}},
+  "M16": {"directions": {"Manhattan": {"label": "Toward Manhattan", "J": "S", "M": "N", "Z": "S"}, "Outbound": {"label": "Toward Jamaica / Middle Village", "J": "N", "M": "S", "Z": "N"}}},
+  "M11": {"directions": {"Manhattan": {"label": "Toward Manhattan", "J": "S", "M": "N", "Z": "S"}, "Outbound": {"label": "Toward Jamaica / Middle Village", "J": "N", "M": "S", "Z": "N"}}}
+}

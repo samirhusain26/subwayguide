@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode
-from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener, install_opener, urlopen
+from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener, install_opener
 
 _lock = threading.RLock()
 _server = None
@@ -18,12 +18,25 @@ _server_thread = None
 _catalog_thread = None
 _token = None
 _catalog_path = None
-_files_dir = None
 _local_opener = None
 
 
+def _catalog_from_cache(catalog_json, catalog_path, refresh_catalog, validate_catalog):
+    catalog = json.loads(catalog_json)
+    validate_catalog(catalog)
+    if catalog_path.exists():
+        try:
+            cached_catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+            validate_catalog(cached_catalog)
+            return cached_catalog
+        except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
+            pass
+    refresh_catalog.atomic_write(catalog, catalog_path)
+    return catalog
+
+
 def _initialize(catalog_json, files_dir):
-    global _server, _server_thread, _catalog_thread, _token, _catalog_path, _files_dir, _local_opener
+    global _server, _server_thread, _catalog_thread, _token, _catalog_path, _local_opener
     with _lock:
         if _server is not None:
             return
@@ -34,7 +47,6 @@ def _initialize(catalog_json, files_dir):
         install_opener(build_opener(HTTPSHandler(context=ssl.create_default_context(cafile=ca_file))))
         _local_opener = build_opener(ProxyHandler({}))
 
-        _files_dir = files_dir
         _catalog_path = Path(files_dir) / "stations.json"
 
         import context_feeds
@@ -42,17 +54,7 @@ def _initialize(catalog_json, files_dir):
         import serve
         from refresh_catalog import validate_catalog
 
-        catalog = json.loads(catalog_json)
-        validate_catalog(catalog)
-        if _catalog_path.exists():
-            try:
-                cached_catalog = json.loads(_catalog_path.read_text(encoding="utf-8"))
-                validate_catalog(cached_catalog)
-                catalog = cached_catalog
-            except (OSError, ValueError, json.JSONDecodeError):
-                refresh_catalog.atomic_write(catalog, _catalog_path)
-        else:
-            refresh_catalog.atomic_write(catalog, _catalog_path)
+        catalog = _catalog_from_cache(catalog_json, _catalog_path, refresh_catalog, validate_catalog)
 
         serve.CATALOG = _catalog_path
         context_feeds.STATIONS_PATH = _catalog_path

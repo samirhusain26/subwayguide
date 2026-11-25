@@ -4,7 +4,7 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
-out="${1:-$root/docs/qa}"
+out="${1:-${SUBWAY_QA_OUTPUT:-${TMPDIR:-/tmp}/subwayguide-ui}}"
 scratch="${SUBWAY_QA_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/subwayguide-host-qa}"
 jdk="${JAVA_HOME:?Set JAVA_HOME to a JDK with javac}/bin"
 sdk="${ANDROID_HOME:?Set ANDROID_HOME to the Android SDK}"
@@ -32,9 +32,13 @@ done
 
 "$jdk/javac" --release 17 -classpath "$android_jar:$classpath" -d "$scratch/classes" \
   "$root"/android/src/main/java/nyc/subway/board/*.java "$here"/*.java
+suites=()
+for source in "$here"/*Test.java; do
+  suites+=("nyc.subway.board.$(basename "$source" .java)")
+done
 "$jdk/java" -Xmx1550m -Djava.awt.headless=true \
   -Djava.io.tmpdir="$scratch/temp" -Dmaven.repo.local="$scratch/maven-cache" \
   -Drobolectric.dependency.repo.url=https://repo.maven.apache.org/maven2 \
   -DassetDir="$root/android/app/src/main/assets" -DcatalogFile="$root/server/stations.json" -DoutDir="$out" \
   -classpath "$scratch/classes:$classpath:$android_jar" \
-  org.junit.runner.JUnitCore nyc.subway.board.HostUiTest nyc.subway.board.AppFlowTest nyc.subway.board.UpdateInstallerTest
+  org.junit.runner.JUnitCore "${suites[@]}"

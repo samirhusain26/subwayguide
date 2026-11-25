@@ -106,6 +106,46 @@ class AlertTests(unittest.TestCase):
         with patch.object(feeds._alert_cache, "get", return_value=snapshot):
             return feeds.notice_for(route, stop, direction, now)
 
+    def test_explicit_partial_selectors_expand_only_at_their_stated_scope(self):
+        line_alert = self.alert("1 trains are suspended", route_id="1")
+        line_alert.effect = gtfs.Alert.NO_SERVICE
+        self.assertTrue(self.notice()["preventsBoarding"])
+        self.assertIsNone(self.notice(route="2"))
+        self.feed.ClearField("entity")
+        self.alert("125 St station is closed", stop_id="116")
+        self.assertTrue(self.notice()["preventsBoarding"])
+        self.assertIsNone(self.notice("115S", "S", "1"))
+
+    def test_alternative_station_wording_with_no_service_stays_informational(self):
+        a = self.alert("Downtown 1 trains will not stop at 125 St", route_id="1", stop_id="116")
+        a.effect = gtfs.Alert.NO_SERVICE
+        self.assertTrue(self.notice()["preventsBoarding"])
+        for stop in ("115S", "117S"):
+            a.informed_entity.add(route_id="1", stop_id=stop)
+            self.assertFalse(self.notice(stop)["preventsBoarding"])
+
+    def test_route_only_suspension_without_auxiliary(self):
+        self.alert("1 trains suspended.", route_id="1").effect = gtfs.Alert.NO_SERVICE
+        self.assertTrue(self.notice()["preventsBoarding"])
+
+    def test_station_and_route_wide_alerts_cover_unscheduled_express_stop(self):
+        self.alert("103 St-Corona Plaza station is closed", stop_id="706")
+        self.assertTrue(self.notice("706", "N", "7X")["preventsBoarding"])
+        self.assertIsNone(self.notice("705", "N", "7"))
+        self.feed.ClearField("entity")
+        self.alert("7X trains suspended.", route_id="7X").effect = gtfs.Alert.NO_SERVICE
+        self.assertTrue(self.notice("706", "N", "7X")["preventsBoarding"])
+        self.assertIsNone(self.notice("706", "N", "7"))
+
+    def test_marcy_alerts_follow_each_services_physical_platform(self):
+        for route, toward in (("M", "N"), ("J", "S")):
+            for selector in ("M16", "M16" + toward):
+                self.feed.ClearField("entity")
+                self.alert(f"Manhattan-bound {route} trains skip Marcy Av", route_id=route, stop_id=selector)
+                self.assertTrue(self.notice("M16", toward, route)["preventsBoarding"])
+                other = self.notice("M16", "S" if toward == "N" else "N", route)
+                self.assertFalse(other and other["preventsBoarding"])
+
     def test_live_bypass_has_three_selectors_but_one_closed_platform(self):
         a = self.alert("Downtown [1] skips 125 St", route_id="1", stop_id="116", direction_id=1)
         for other in ("112", "117"):
@@ -210,7 +250,8 @@ class WeatherTests(unittest.TestCase):
         def upstream(endpoint, accept, limit):
             return json.dumps({"properties": hourly if endpoint == url else points}).encode()
 
-        with patch.object(feeds, "_fetch", side_effect=upstream) as fetch:
+        with patch.object(feeds.time, "time", return_value=NOW), patch.object(
+                feeds, "_fetch", side_effect=upstream) as fetch:
             weather = feeds._load_weather("40.8156,-73.9584", None)
             self.assertEqual([call.args[0] for call in fetch.call_args_list],
                              [feeds._POINTS + "40.8156,-73.9584", url])
@@ -238,6 +279,21 @@ class WeatherTests(unittest.TestCase):
                     feeds._weather_cache, "get", return_value=feeds._Weather(
                         url, 0, weather.periods, NOW - 86400)):
                 self.assertIsNone(feeds.weather_for(40, -74))
+
+    def test_weather_rejects_future_stale_and_regressed_updates(self):
+        url = "https://api.weather.gov/gridpoints/OKX/34,47/forecast/hourly"
+        valid = {"updateTime": "2024-01-01T00:00:00Z", "periods": []}
+        previous = feeds._Weather(url, 0, (), NOW)
+        with patch.object(feeds.time, "time", return_value=NOW), patch.object(
+                feeds.time, "monotonic", return_value=0), patch.object(
+                feeds, "_properties", return_value=valid):
+            self.assertEqual(feeds._load_weather("40,-74", previous), previous)
+            for update in ("2024-01-01T00:00:01Z", "2023-12-31T23:00:00Z"):
+                with self.subTest(update=update):
+                    with patch.object(feeds, "_properties", return_value={
+                            "updateTime": update, "periods": []}):
+                        with self.assertRaises(ValueError):
+                            feeds._load_weather("40,-74", previous)
 
     def test_invalid_coords_or_hourly_url(self):
         with patch.object(feeds._weather_cache, "get") as cache:

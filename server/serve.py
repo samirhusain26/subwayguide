@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from context_feeds import notice_state_for, weather_for
+from context_feeds import notice_states_for, weather_for
 from transit import get_arrivals
 
 CATALOG = Path(__file__).with_name("stations.json")
@@ -60,7 +60,9 @@ def refresh_periodically(server, stop):
         try:
             age = time.time() - CATALOG.stat().st_mtime
             if age >= REFRESH_INTERVAL:
-                catalog = refresh(fetch(), download(GTFS_URL), CATALOG)
+                rows = fetch()
+                with download(GTFS_URL, CATALOG.parent) as gtfs:
+                    catalog = refresh(rows, gtfs, CATALOG)
                 server.install_directory(catalog)
         except Exception:
             logging.exception("Station refresh failed; keeping the previous directory")
@@ -120,11 +122,32 @@ def make_board(station, route, direction, stations):
     now = int(time.time())
     # Optional lookups have isolated caches and never gate a train prediction.
     weather = weather_for(station["lat"], station["lon"])
-    notices_ready, notice = notice_state_for(route, station["id"], direction, now)
-    if notice and notice["preventsBoarding"]:
+    # Notices apply to the route reported by each train. A base line and its
+    # express variant can share a feed, but a closure of one must not hide the other.
+    actual_routes = [route] + sorted({row.get("route", route) for row in board.get("arrivals", [])} - {route})
+    notices_ready, notices_by_route = notice_states_for(actual_routes, station["id"], direction, now)
+    filtered = []
+    blocked = {actual for actual, notice in notices_by_route.items()
+               if notice and notice["preventsBoarding"]}
+    for row in board.get("arrivals", []):
+        actual = row.get("route", route)
+        if actual not in blocked:
+            filtered.append(row)
+    # Explain the selected route's closure first, then a filtered variant in
+    # stable route order, then any remaining advisory.
+    alert_routes = [route] + [actual for actual in actual_routes if actual != route]
+    alert_route = next((actual for actual in alert_routes
+                        if notices_by_route.get(actual) and
+                        notices_by_route[actual]["preventsBoarding"]), None)
+    if alert_route is None:
+        alert_route = next((actual for actual in alert_routes if notices_by_route.get(actual)), None)
+    alert = notices_by_route[alert_route]["text"] if alert_route else None
+    if route in blocked and not filtered:
         board = dict(board, status="disrupted", arrivals=[])
+    elif len(filtered) != len(board.get("arrivals", [])):
+        board = dict(board, arrivals=filtered)
     return dict(board, serverTime=now, weather=weather, noticesReady=notices_ready,
-                alert=notice["text"] if notice else None)
+                actualRouteNoticesChecked=True, terminalEvidenceSupported=True, alert=alert)
 
 
 def main():

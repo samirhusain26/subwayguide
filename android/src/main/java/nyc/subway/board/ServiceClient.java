@@ -35,20 +35,34 @@ final class ServiceClient {
     }
   }
 
-  static JSONObject board(JSONObject config) throws Exception {
-    return board(config, config.getString("route"));
+  /** One sequential board poll can have at most one HTTP connection in flight. */
+  static final class Poll {
+    private boolean cancelled;
+    private HttpURLConnection connection;
+
+    synchronized void attach(HttpURLConnection next) throws IOException {
+      if (cancelled) throw new java.io.InterruptedIOException("Poll superseded");
+      connection = next;
+    }
+
+    synchronized void detach() { connection = null; }
+
+    synchronized void cancel() {
+      cancelled = true;
+      if (connection != null) connection.disconnect();
+    }
   }
 
-  static JSONObject board(JSONObject config, String route) throws Exception {
+  static JSONObject board(JSONObject config, String route, String direction, Poll poll) throws Exception {
     String path =
         new Uri.Builder()
             .path("/v1/board")
             .appendQueryParameter("station", config.getString("station"))
             .appendQueryParameter("route", route)
-            .appendQueryParameter("direction", config.getString("direction"))
+            .appendQueryParameter("direction", direction)
             .build()
             .toString();
-    return get(origin(config.getString("server")) + path);
+    return get(origin(config.getString("server")) + path, poll);
   }
 
   static final class UnknownSelection extends IOException {
@@ -58,6 +72,10 @@ final class ServiceClient {
   }
 
   static JSONObject get(String address) throws Exception {
+    return get(address, null);
+  }
+
+  private static JSONObject get(String address, Poll poll) throws Exception {
     HttpURLConnection c = (HttpURLConnection) new URL(address).openConnection();
     c.setConnectTimeout(4000);
     c.setReadTimeout(10000);
@@ -65,6 +83,7 @@ final class ServiceClient {
     c.setUseCaches(false);
     c.setRequestProperty("Accept", "application/json");
     try {
+      if (poll != null) poll.attach(c);
       int code = c.getResponseCode();
       if (code == 400) throw new UnknownSelection();
       if (code != 200) throw new IOException("Service returned " + code);
@@ -72,6 +91,7 @@ final class ServiceClient {
         return new JSONObject(read(input));
       }
     } finally {
+      if (poll != null) poll.detach();
       c.disconnect();
     }
   }

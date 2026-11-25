@@ -12,8 +12,8 @@ android {
         applicationId 'nyc.subway.board'
         minSdk 22
         targetSdk 35
-        versionCode 7
-        versionName '1.3.1'
+        versionCode 8
+        versionName '1.4.0'
         ndk { abiFilters 'armeabi-v7a', 'arm64-v8a' }
     }
 
@@ -24,19 +24,9 @@ android {
         main.assets.srcDir layout.buildDirectory.dir('generated/catalogAssets')
     }
 
-    signingConfigs {
-        localDebug {
-            storeFile file("${System.getProperty('user.home')}/.local/share/subwayguide/debug.keystore")
-            storePassword 'android'
-            keyAlias 'androiddebugkey'
-            keyPassword 'android'
-        }
-    }
-
     buildTypes {
-        debug { signingConfig signingConfigs.localDebug }
+        // The release script signs the assembled APK and verifies the recipient's certificate.
         release {
-            signingConfig signingConfigs.localDebug
             minifyEnabled false
             shrinkResources false
         }
@@ -49,8 +39,8 @@ chaquopy {
         buildPython(System.getenv('CHAQUOPY_BUILD_PYTHON') ?: 'python3.11')
         pip {
             install '-r', '../../server/requirements.txt'
-            install 'certifi'
-            install 'tzdata'
+            install 'certifi==2026.11.20'
+            install 'tzdata==2026.6'
         }
     }
     sourceSets {
@@ -63,6 +53,7 @@ chaquopy {
 
 tasks.register('stageStationCatalog', Sync) {
     from('../../server/stations.json')
+    from('../../server/trip_data/trip_direction_overrides.json')
     into(layout.buildDirectory.dir('generated/catalogAssets'))
 }
 

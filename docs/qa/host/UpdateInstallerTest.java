@@ -32,6 +32,11 @@ public class UpdateInstallerTest {
   private static PackageInfo info(String name, int code, byte signer) {
     PackageInfo record = new PackageInfo();
     record.packageName = name;
+    if (android.os.Build.VERSION.SDK_INT < 28) {
+      record.versionCode = code;
+      record.signatures = new Signature[]{new Signature(new byte[]{signer})};
+      return record;
+    }
     record.setLongVersionCode(code);
     record.signingInfo = ReflectionHelpers.callConstructor(SigningInfo.class);
     Shadows.shadowOf(record.signingInfo).setSignatures(new Signature[]{new Signature(new byte[]{signer})});
@@ -57,6 +62,12 @@ public class UpdateInstallerTest {
     }
   }
 
+  @Test @Config(sdk = 27) public void legacySignerAndVersionAreChecked() throws Exception {
+    rejectsWrongAppSignerAndVersion();
+    packages.setPackageArchiveInfo(apk.getPath(), info(PACKAGE, 7, (byte) 1));
+    assertEquals(7, UpdateInstaller.code(UpdateInstaller.validate(app, apk)));
+  }
+
   @Test public void commitsNewerSignedPackageAndOpensSystemConfirmation() throws Exception {
     packages.setPackageArchiveInfo(apk.getPath(), info(PACKAGE, 7, (byte) 1));
     UpdateInstaller.install(app, apk, apk.length());
@@ -70,5 +81,57 @@ public class UpdateInstallerTest {
     UpdateInstallActivity callback = Robolectric.buildActivity(UpdateInstallActivity.class, status).create().get();
     assertEquals(confirmation.getAction(), Shadows.shadowOf(callback).getNextStartedActivity().getAction());
     assertTrue(callback.isFinishing());
+    int id = status.getIntExtra(UpdateInstaller.CALLBACK_SESSION, -1);
+    assertTrue(id >= 0);
+    assertEquals(id, app.getSharedPreferences("subway-update", 0).getInt("activeSession", -1));
+    // The shadow does not model commit() sealing the SessionInfo; supply Android's sealed state to
+    // verify startup recovery preserves a submitted session after the process-local guard is lost.
+    PackageInstaller.SessionInfo sessionInfo = app.getPackageManager().getPackageInstaller().getSessionInfo(id);
+    ReflectionHelpers.setField(sessionInfo, "sealed", true);
+    MainActivity.UPDATE_INSTALLING.set(false);
+    assertTrue(UpdateInstaller.active(app));
+    UpdateInstaller.finished(app, id + 1);
+    assertEquals(id, app.getSharedPreferences("subway-update", 0).getInt("activeSession", -1));
+    status.putExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE_ABORTED);
+    Robolectric.buildActivity(UpdateInstallActivity.class, status).create();
+    assertFalse(UpdateInstaller.active(app));
+  }
+
+  @Test public void promotesIncomingAndKeepsNewerValidCache() throws Exception {
+    File incoming = new File(app.getFilesDir(), "incoming.apk");
+    File cached = new File(app.getFilesDir(), "SubwayBoard.apk");
+    Files.write(incoming.toPath(), new byte[]{7});
+    Files.write(cached.toPath(), new byte[]{6});
+    packages.setPackageArchiveInfo(incoming.getPath(), info(PACKAGE, 7, (byte) 1));
+    packages.setPackageArchiveInfo(cached.getPath(), info(PACKAGE, 8, (byte) 1));
+
+    assertEquals(8, UpdateInstaller.code(UpdateInstaller.promote(app, incoming, cached)));
+    assertArrayEquals(new byte[]{6}, Files.readAllBytes(cached.toPath()));
+    assertTrue(incoming.exists());
+
+    packages.setPackageArchiveInfo(incoming.getPath(), info(PACKAGE, 9, (byte) 1));
+    assertEquals(9, UpdateInstaller.code(UpdateInstaller.promote(app, incoming, cached)));
+    assertArrayEquals(new byte[]{7}, Files.readAllBytes(cached.toPath()));
+    assertFalse(incoming.exists());
+  }
+
+  @Test public void discardsAnUnsubmittedSessionLeftByProcessDeath() throws Exception {
+    discardUnsubmittedSession();
+  }
+
+  @Test @Config(sdk = 27)
+  public void discardsAnUnsubmittedSessionUsingTheApi26SealedState() throws Exception {
+    discardUnsubmittedSession();
+  }
+
+  private void discardUnsubmittedSession() throws Exception {
+    PackageInstaller installer = app.getPackageManager().getPackageInstaller();
+    int id = installer.createSession(new PackageInstaller.SessionParams(
+        PackageInstaller.SessionParams.MODE_FULL_INSTALL));
+    app.getSharedPreferences("subway-update", 0).edit().putInt("activeSession", id).commit();
+
+    assertFalse(UpdateInstaller.active(app));
+    assertNull("An unsubmitted session is abandoned during startup recovery", installer.getSessionInfo(id));
+    assertFalse(app.getSharedPreferences("subway-update", 0).contains("activeSession"));
   }
 }

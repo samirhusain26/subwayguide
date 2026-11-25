@@ -16,6 +16,10 @@ public final class LocalBoard {
   private static String bundledCatalog;
   private static boolean initialized;
 
+  static java.io.InputStream openAsset(Context context, String name) throws java.io.IOException {
+    return context.getAssets().open(name);
+  }
+
   private LocalBoard() {}
 
   public static JSONObject board(Context context, String station, String route, String direction)
@@ -49,23 +53,24 @@ public final class LocalBoard {
 
   private static PyObject call(Context context, String method, Object... args) {
     if (context == null) throw new IllegalArgumentException("Context is required");
-    synchronized (LOCK) {
-      try {
+    PyObject module;
+    try {
+      synchronized (LOCK) {
         if (bundledCatalog == null) {
-          try (InputStream input = context.getAssets().open("stations.json")) {
+          try (InputStream input = openAsset(context, "stations.json")) {
             bundledCatalog = ServiceClient.read(input);
           }
         }
         if (!Python.isStarted()) Python.start(new AndroidPlatform(context.getApplicationContext()));
-        PyObject module = Python.getInstance().getModule("embedded_board");
+        module = Python.getInstance().getModule("embedded_board");
         if (!initialized) {
           module.callAttr("initialize", bundledCatalog, context.getFilesDir().getAbsolutePath());
           initialized = true;
         }
-        return module.callAttr(method, args);
-      } catch (Exception e) {
-        throw new IllegalStateException("Local board service could not initialize", e);
       }
+      return module.callAttr(method, args);
+    } catch (Exception e) {
+      throw new IllegalStateException("Local board service request failed", e);
     }
   }
 

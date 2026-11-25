@@ -37,6 +37,29 @@ public class AppFlowTest {
 
   private final AtomicReference<String> served = new AtomicReference<>();
 
+  @Test public void recreationKeepsUncommittedWalkAndEditorSection() throws Exception {
+    ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class);
+    MainActivity app = controller.get();
+    app.setTheme(android.R.style.Theme_Material_NoActionBar);
+    controller.setup();
+    try {
+      View root = app.findViewById(android.R.id.content);
+      HostUiTest.named(root, "Settings").performClick();
+      HostUiTest.named(root, "Increase Walk to the platform").performClick();
+      HostUiTest.named(root, "Sound").performClick();
+      controller.recreate();
+      View restoredRoot = controller.get().findViewById(android.R.id.content);
+      SettingsScreen restored = HostUiTest.first(restoredRoot, SettingsScreen.class);
+      assertEquals(2, restored.uiState().getInt("section"));
+      assertEquals(11, restored.draft().getInt("walk"));
+      HostUiTest.named(restoredRoot, "‹   Cancel").performClick();
+      HostUiTest.named(restoredRoot, "Settings").performClick();
+      assertEquals(10, HostUiTest.first(restoredRoot, SettingsScreen.class).draft().getInt("walk"));
+    } finally {
+      controller.pause().stop().destroy();
+    }
+  }
+
   @Test
   public void combinesUnionSquareLinesAndKeepsTheSelectionAfterRestart() throws Exception {
     AtomicReference<String> mode = new AtomicReference<>("both");
@@ -50,6 +73,13 @@ public class AppFlowTest {
       requested.add(query.getQueryParameter("station") + "/" + route + "/" + query.getQueryParameter("direction"));
       try {
         boolean isW = "W".equals(route);
+        if (mode.get().equals("W retired") && isW || mode.get().equals("mixed failure")) {
+          int code = isW ? 400 : 503;
+          exchange.sendResponseHeaders(code, -1);
+          exchange.close();
+          served.set(mode.get());
+          return;
+        }
         boolean suspended = isW && "W suspended".equals(mode.get());
         org.json.JSONArray arrivals = new org.json.JSONArray();
         if (!suspended) {
@@ -59,10 +89,13 @@ public class AppFlowTest {
               .put("destination", isW ? "Whitehall St" : "Coney Island")
               .put("time", MORNING + (isW ? 805 : 1050)));
         }
+        if (!isW && mode.get().equals("notices pending")) arrivals = new org.json.JSONArray();
+        if (isW && mode.get().equals("expiring movement"))
+          for (int i = 0; i < arrivals.length(); i++) arrivals.getJSONObject(i).put("validUntil", MORNING + 5);
         long feedTime = isW && "W aging".equals(mode.get()) ? MORNING - 52 : MORNING;
         JSONObject payload = new JSONObject().put("status", suspended ? "disrupted" : "ok")
             .put("serverTime", MORNING).put("feedTime", feedTime)
-            .put("noticesReady", true).put("arrivals", arrivals);
+            .put("noticesReady", !(isW && mode.get().equals("notices pending"))).put("arrivals", arrivals);
         payload.put("alert", suspended ? "W boarding suspended at Union Square" : JSONObject.NULL);
         write(exchange, payload.toString().getBytes(StandardCharsets.UTF_8));
         served.set(mode.get());
@@ -104,8 +137,70 @@ public class AppFlowTest {
       BoardView board = HostUiTest.first(reopened, BoardView.class);
       assertTrue(board.getChildAt(0).getContentDescription().toString(), boardSays(reopened, "Leave in 7 min"));
       assertFalse(boardSays(reopened, "Whitehall St"));
+      assertTrue(boardSays(reopened, "W times unavailable"));
+      saveBoard(board, "board-partial-lines");
+      poll(mode, "notices pending", reopened, "Checking service");
+      assertTrue(boardSays(reopened, "Whitehall St"));
+      assertFalse(boardSays(reopened, "Leave in"));
+      poll(mode, "expiring movement", reopened, "Whitehall St");
+      Shadows.shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(7));
+      assertTrue(boardSays(reopened, "Leave in 7 min"));
+      assertFalse(boardSays(reopened, "Whitehall St"));
+      poll(mode, "mixed failure", reopened, "Service offline");
+      poll(mode, "W retired", reopened, "Leave in 7 min");
+      assertTrue(boardSays(reopened, "W selection unavailable"));
       assertEquals(java.util.Set.of("R20/N/S", "R20/W/S"), requested);
     } finally {
+      controller.pause().stop().destroy();
+      server.stop(0);
+    }
+  }
+
+  @Test public void marcyLegacyTripRequestsEachPlatformAndWaitsForServerResponse() throws Exception {
+    java.util.concurrent.CountDownLatch started = new java.util.concurrent.CountDownLatch(1);
+    java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+    java.util.Set<String> requests = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+    server.createContext("/v1/board", exchange -> {
+      android.net.Uri query = android.net.Uri.parse(exchange.getRequestURI().toString());
+      String route = query.getQueryParameter("route");
+      requests.add(route + "/" + query.getQueryParameter("direction"));
+      try {
+        if (route.equals("J")) {
+          started.countDown();
+          if (!release.await(10, java.util.concurrent.TimeUnit.SECONDS)) throw new IOException("fixture timeout");
+        }
+        JSONObject train = new JSONObject().put("id", route).put("route", route)
+            .put("time", MORNING + (route.equals("M") ? 790 : 780))
+            .put("destination", route.equals("J") ? "Broad St" : "Forest Hills-71 Av")
+            .put("terminalName", route.equals("J") ? "Broad St" : "Forest Hills-71 Av")
+            .put("terminalId", route.equals("J") ? "M23" : "G08");
+        JSONObject payload = new JSONObject().put("status", "ok").put("serverTime", MORNING)
+            .put("feedTime", MORNING - 55).put("noticesReady", true)
+            .put("arrivals", new org.json.JSONArray().put(train));
+        write(exchange, payload.toString().getBytes(StandardCharsets.UTF_8));
+      } catch (org.json.JSONException | InterruptedException e) { throw new IOException(e); }
+    });
+    server.start();
+    ActivityController<MainActivity> controller = Robolectric.buildActivity(MainActivity.class);
+    try {
+      MainActivity app = controller.get();
+      JSONObject old = new JSONObject().put("station", "M16").put("route", "J")
+          .put("routes", new org.json.JSONArray().put("J").put("M")).put("direction", "S")
+          .put("destination", "Forest Hills-71 Av")
+          .put("server", "http://127.0.0.1:" + server.getAddress().getPort());
+      app.getSharedPreferences("subway-board", 0).edit().putString("settings", old.toString()).commit();
+      app.setTheme(android.R.style.Theme_Material_NoActionBar);
+      controller.setup();
+      assertTrue(started.await(5, java.util.concurrent.TimeUnit.SECONDS));
+      Shadows.shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(9));
+      release.countDown();
+      View content = app.findViewById(android.R.id.content);
+      until(() -> boardSays(content, "Forest Hills-71 Av") && boardSays(content, "Leave in 3 min"));
+      assertFalse(boardSays(content, "Broad St"));
+      assertEquals(java.util.Set.of("J/S", "M/N"), requests);
+    } finally {
+      release.countDown();
       controller.pause().stop().destroy();
       server.stop(0);
     }
@@ -230,7 +325,7 @@ public class AppFlowTest {
       poll(mode, "stale", root, "Arrivals delayed");
       assertFalse(boardSays(root, "Leave now"));
       poll(mode, "disrupted", root, "Service change");
-      HostUiTest.save(HostUiTest.first(root, BoardView.class), "board-service-change");
+      saveBoard(HostUiTest.first(root, BoardView.class), "board-service-change");
       HostUiTest.named(root, "Settings").performClick();
       HostUiTest.named(root, "Sound").performClick();
       HostUiTest.named(root, "Test chime").performClick();
@@ -272,6 +367,12 @@ public class AppFlowTest {
         return true;
     }
     return false;
+  }
+
+  private static void saveBoard(BoardView board, String image) throws Exception {
+    HostUiTest.measure(board);
+    until(board::isMapCompositionReady);
+    HostUiTest.save(board, image);
   }
 
   private static void until(BooleanSupplier result) throws Exception {

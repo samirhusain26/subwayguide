@@ -12,6 +12,10 @@ from urllib.request import Request, urlopen
 
 from google.protobuf.message import DecodeError
 from google.transit import gtfs_realtime_pb2 as gtfs
+if __package__:
+    from .trip_data import direction_name
+else:
+    from trip_data import direction_name
 
 _BASE = "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs"
 _GROUPS = {
@@ -110,7 +114,7 @@ class _CachedFeed:
         for key, rider_id in ids.items():
             if key not in held:
                 chime_id = rider_id if stamp >= silence_until and rider_id not in conflicts else ""
-                trips[key] = (chime_id, key in moving)
+                trips[key] = (chime_id, moving.get(key, 0))
         return trips, conflicts, silence_until
 
     def _refresh(self, url, done, deadline):
@@ -215,7 +219,7 @@ def _train_conditions(feed, by_origin):
                 key = _trip_key(vehicle.trip)
                 matches = _matching_updates(by_origin, key)
                 if len(matches) == 1:
-                    source = (matches[0], key, vehicle.vehicle.id)
+                    source = (matches[0], key, vehicle.vehicle.id or entity.id)
                     latest[source] = max(latest.get(source, 0), vehicle.timestamp)
                 elif feed.header.timestamp - vehicle.timestamp > _STALL_AGE:
                     held.update(matches)
@@ -238,12 +242,12 @@ def _train_conditions(feed, by_origin):
 
     # Fresh evidence from one source cannot clear a different source's stall.
     # Only uniquely attributable movement can validate an overdue origin.
-    moving = set()
+    moving = {}
     for (target, _, _), stamp in latest.items():
         if feed.header.timestamp - stamp > _STALL_AGE:
             held.add(target)
         else:
-            moving.add(target)
+            moving[target] = min(moving.get(target, stamp), stamp)
     return moving, held
 
 
@@ -251,27 +255,27 @@ def _serves(stop):
     return stop.schedule_relationship in (stop.SCHEDULED, stop.UNSCHEDULED)
 
 
-def _destination(last, board_time, route, stations, fallback):
+def _terminal_name(last, board_time, route, stations):
     # NYCT specifies an arrival at a terminal. A truncated list may instead
     # end at a through stop with a departure. Require corroboration in that case.
     platform = last.stop_id
     if (not _serves(last) or platform[-1:] not in ("N", "S")
             or last.arrival.time < board_time):
-        return fallback
+        return None
     terminal = stations.get(platform[:-1])
     if not terminal or not terminal.get("name"):
-        return fallback
+        return None
     # At a shared station other lines may continue past this route's terminal.
     route_directions = terminal.get("routeDirections", {}).get(route)
     directions = terminal.get("directions", {}) if route_directions is None else route_directions
     if last.departure.time and not (directions and platform[-1] not in directions):
-        return fallback
+        return None
     return terminal["name"]
 
 
 def _arrivals(feed, now, station, route, direction, stations, trips):
     platform = station["id"] + direction
-    fallback = station["directions"].get(direction) or {"N": "Northbound", "S": "Southbound"}[direction]
+    fallback = direction_name(station, route, direction)
     arrivals = []
     for entity in feed.entity:
         if entity.is_deleted or not entity.HasField("trip_update"):
@@ -286,15 +290,20 @@ def _arrivals(feed, now, station, route, direction, stations, trips):
         key = _trip_key(trip)
         if key not in trips:
             continue
-        rider_id, moving = trips[key]
+        rider_id, movement_time = trips[key]
+        moving = bool(movement_time)
         stops = update.stop_time_update
         if len(stops) < 2:
             continue
         # No vehicle position is expected before origin departure. An explicitly
         # overdue departure-only origin still makes its downstream ETAs suspect.
         first = stops[0]
-        if (not moving and _serves(first) and not first.arrival.time
-                and 0 < first.departure.time < feed.header.timestamp - _STALL_AGE):
+        valid_until = feed.header.timestamp + _FRESH_AGE
+        if movement_time:
+            valid_until = min(valid_until, movement_time + _STALL_AGE)
+        if not moving and _serves(first) and not first.arrival.time and first.departure.time > 0:
+            valid_until = min(valid_until, first.departure.time + _STALL_AGE)
+        if now > valid_until:
             continue
         for i, stop in enumerate(stops):
             if stop.stop_id != platform or not _serves(stop):
@@ -306,14 +315,19 @@ def _arrivals(feed, now, station, route, direction, stations, trips):
                 continue
             # A terminal can carry a departure field, and skipped stops can
             # trail the last served stop. Require an actual onward stop.
-            onward = next((later.stop_id for later in stops[i + 1:]
+            onward_stops = [later.stop_id for later in stops[i + 1:]
                 if _serves(later) and later.stop_id[-1:] in ("N", "S")
                 and later.stop_id[:-1] != station["id"]
                 and max(later.arrival.time, later.departure.time) >= eta
-            ), None)
+            ]
+            onward = onward_stops[0] if onward_stops else None
             if onward:
+                last = stops[-1]
+                terminal = _terminal_name(last, eta, actual_route, stations)
                 arrivals.append({"id": rider_id, "time": eta, "route": actual_route, "onward": onward,
-                                 "destination": _destination(stops[-1], eta, actual_route, stations, fallback)})
+                                 "onwardStops": onward_stops, "validUntil": valid_until,
+                                 "destination": terminal or fallback,
+                                 **({"terminalId": last.stop_id[:-1], "terminalName": terminal} if terminal else {})})
                 break
     return sorted(arrivals, key=lambda row: (row["time"], row["id"]))
 

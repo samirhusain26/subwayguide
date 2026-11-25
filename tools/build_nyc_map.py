@@ -4,8 +4,14 @@ Run with Pillow and pyshp 2.x. This is a developer tool, never run on the phone.
 """
 import argparse
 import csv
+import fcntl
 import io
 import json
+import hashlib
+import os
+import shutil
+import tempfile
+import time
 from itertools import combinations
 import zipfile
 from collections import Counter, defaultdict
@@ -183,6 +189,104 @@ def schedule(archive, catalog):
             'shapes': {k: [n for xy in simplify(pts) for n in xy] for k, pts in shapes.items()}}, shapes
 
 
+def validate_atlas(output, metadata, manifest=None):
+    """Check the complete runtime atlas before any generated files are promoted."""
+    expected = {f'8-{col}-{row}.png' for col in range(16) for row in range(16)}
+    expected |= {f'64-{col}-{row}.png' for col in range(-4, 4) for row in range(-3, 5)}
+    actual = {p.name for p in output.glob('*.png')}
+    if actual != expected:
+        raise ValueError(f'Atlas tile set mismatch: missing={sorted(expected-actual)} unexpected={sorted(actual-expected)}')
+    for name in sorted(expected):
+        with Image.open(output / name) as tile:
+            if tile.size != (512, 512):
+                raise ValueError(f'Invalid dimensions for {name}: {tile.size}')
+            tile.verify()
+    stations = metadata.get('stations', {})
+    shapes = metadata.get('shapes', {})
+    for route, patterns in metadata.get('routes', {}).items():
+        for pattern in patterns:
+            if len(pattern) != 3 or pattern[0] not in shapes or len(pattern[2]) < 2:
+                raise ValueError(f'Invalid scheduled pattern for {route}: {pattern[:2]}')
+            if len(shapes[pattern[0]]) < 4 or len(shapes[pattern[0]]) % 2:
+                raise ValueError(f'Invalid shape reference {pattern[0]}')
+            for platform in pattern[2]:
+                if platform[:-1] not in stations or platform[-1:] not in ('N', 'S'):
+                    raise ValueError(f'Invalid platform reference {platform}')
+    if manifest is None:
+        manifest = json.loads((output / 'manifest.json').read_text())
+    expected_files = expected | {'network.json'}
+    if manifest.get('format') != 1 or not manifest.get('gtfsVersion'):
+        raise ValueError('Atlas manifest is missing its format or GTFS version')
+    recorded = manifest.get('files')
+    if not isinstance(recorded, dict) or set(recorded) != expected_files:
+        raise ValueError('Atlas manifest file list does not match the complete tile grid')
+    for name, expected_digest in recorded.items():
+        if digest(output / name) != expected_digest:
+            raise ValueError(f'Atlas file digest mismatch: {name}')
+    if manifest.get('gtfsSha256') is not None and len(manifest['gtfsSha256']) != 64:
+        raise ValueError('Invalid GTFS archive digest')
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open('rb') as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_manifest(inputs, gtfs, archive, staging):
+    feed_version = 'not-provided'
+    if 'feed_info.txt' in archive.namelist():
+        with archive.open('feed_info.txt') as raw:
+            info = next(csv.DictReader(io.TextIOWrapper(raw, encoding='utf-8-sig', newline='')), {})
+            feed_version = info.get('feed_version') or info.get('feed_start_date') or feed_version
+    sources = {}
+    for path in sorted(p for p in inputs.iterdir() if p.is_file()):
+        sources[path.name] = digest(path)
+    files = {path.name: digest(path) for path in staging.iterdir() if path.name != 'manifest.json'}
+    (staging / 'manifest.json').write_text(json.dumps({
+        'format': 1, 'gtfsVersion': feed_version, 'gtfsSha256': digest(gtfs),
+        'inputs': sources, 'files': files,
+    }, sort_keys=True, indent=2) + '\n')
+
+
+def recover_previous(output, root):
+    """Restore the newest validated generator-owned backup if promotion was interrupted."""
+    if output.exists():
+        return
+    for candidate in sorted(root.glob('.nyc-atlas-previous-*'), reverse=True):
+        try:
+            metadata = json.loads((candidate / 'network.json').read_text())
+            manifest = json.loads((candidate / 'manifest.json').read_text())
+            validate_atlas(candidate, metadata, manifest)
+            os.replace(candidate, output)
+            return
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+
+
+def cleanup_stale_staging(root):
+    """Remove only interrupted staging dirs created under this generator's reserved prefix."""
+    for candidate in root.glob('.nyc-atlas-staging-*'):
+        if candidate.parent == root and candidate.is_dir() and not candidate.is_symlink():
+            shutil.rmtree(candidate)
+
+
+def promote(staging, output, root):
+    previous = root / ('.nyc-atlas-previous-' + str(time.time_ns()))
+    moved_old = False
+    try:
+        if output.exists():
+            os.replace(output, previous)
+            moved_old = True
+        os.replace(staging, output)
+    except Exception:
+        if moved_old and not output.exists():
+            os.replace(previous, output)
+        raise
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('inputs', type=Path)
@@ -190,12 +294,25 @@ def main():
     args = p.parse_args()
     root = Path(__file__).resolve().parents[1]
     output = root / 'android/app/src/main/assets/nyc'
-    output.mkdir(parents=True, exist_ok=True)
-    catalog = json.loads((root / 'server/stations.json').read_text())['stations']
-    with zipfile.ZipFile(args.gtfs) as archive:
-        metadata, shapes = schedule(archive, {s['id']: s for s in catalog})
-    (output / 'network.json').write_text(json.dumps(metadata, separators=(',', ':')))
-    render(args.inputs, output, shapes)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = root / '.nyc-atlas-build.lock'
+    with lock_path.open('a') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        cleanup_stale_staging(root)
+        recover_previous(output, root)
+        catalog = json.loads((root / 'server/stations.json').read_text())['stations']
+        staging = Path(tempfile.mkdtemp(prefix='.nyc-atlas-staging-', dir=root))
+        try:
+            with zipfile.ZipFile(args.gtfs) as archive:
+                metadata, shapes = schedule(archive, {s['id']: s for s in catalog})
+                (staging / 'network.json').write_text(json.dumps(metadata, separators=(',', ':')))
+                render(args.inputs, staging, shapes)
+                build_manifest(args.inputs, args.gtfs, archive, staging)
+            validate_atlas(staging, metadata)
+            promote(staging, output, root)
+        finally:
+            if staging.exists(): shutil.rmtree(staging)
+    # Keep the prior complete generation outside the APK asset tree for recovery.
 
 
 if __name__ == '__main__':

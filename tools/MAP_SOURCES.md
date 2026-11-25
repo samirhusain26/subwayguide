@@ -1,6 +1,6 @@
 # Offline NYC map
 
-The Android app reads the packaged atlas from `android/app/src/main/assets/nyc`. No map account, tile requests or location permission are needed. It uses different basemap resolutions for a neighborhood and a complete subway route. The route overlay and station labels are drawn at the screen resolution.
+The Android app reads the packaged atlas from `android/app/src/main/assets/nyc`. No map account, tile requests or location permission are needed. It uses different basemap resolutions for a neighborhood and a complete subway route. The route overlay and station labels are drawn at the screen resolution. The source schedule and its geographic shape are retained; each selected passenger pattern is clipped to its first and last served station when rendered, so extra shape geometry cannot extend past its passenger endpoints.
 
 ## Rebuild the atlas
 
@@ -22,4 +22,8 @@ From the repository root, on the development Mac, run the following command with
 ~/.local/bin/dev-storage run -- uv run --python 3.11 --with 'pyshp<3' --with Pillow python tools/build_nyc_map.py /path/to/map-inputs /path/to/gtfs_subway.zip
 ```
 
-The generator checks that every selectable catalog platform and route has a scheduled pattern. The atlas is distributed with the app and can differ from temporary diversions or a newly updated station catalog. A station missing from the map still has access to the ordinary arrivals board.
+The generator checks that every selectable catalog platform and route has a scheduled pattern, validates all 256 detail tiles and 64 overview tiles at 512 × 512, then promotes the staged atlas only after every tile and schedule reference passes. It writes `manifest.json` with the GTFS version, GTFS SHA-256 and each input file digest. Staging and prior complete generations live in hidden `.nyc-atlas-*` directories at the repository root, outside APK assets. A process lock serializes generators; it removes only abandoned directories with its reserved staging prefix. If promotion is interrupted after moving the old atlas, the next run validates and restores the newest complete backup first. Keep old generations as recovery evidence and remove them only as an explicit cleanup. The atlas can differ from temporary diversions or a newly updated station catalog. A station missing from the map still has access to the ordinary arrivals board.
+
+The checked-in historical atlas records the known GTFS version and hashes for `network.json` and every tile. Its original GTFS and map archives were not retained, so the manifest explicitly leaves their source hashes unrecorded. Newly generated atlases include the exact archive and source input hashes.
+
+Patterns with matching destination and next-stop evidence are further compared with any downstream platform IDs reported for the actual train. When multiple scheduled patterns still fit, the map labels its path **Representative scheduled route** so the diagram does not imply a proven express/local stop sequence.

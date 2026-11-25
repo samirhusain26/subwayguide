@@ -9,6 +9,14 @@ import org.json.JSONObject;
 
 /** Host-only stand-in at the Android native-runtime boundary. Never included in the APK. */
 final class LocalBoard {
+  static java.io.InputStream openAsset(Context context, String name) throws java.io.IOException {
+    Path catalog = Path.of(System.getProperty("catalogFile"));
+    Path file = name.equals("stations.json") ? catalog
+        : name.equals("trip_direction_overrides.json") ? catalog.resolveSibling("trip_data").resolve(name)
+        : Path.of(System.getProperty("assetDir")).resolve(name);
+    return Files.newInputStream(file);
+  }
+
   static volatile String lastTrip;
 
   static JSONObject board(Context context, String station, String route, String direction)

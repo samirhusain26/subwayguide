@@ -27,6 +27,8 @@ import org.json.JSONObject;
 
 /** The four sections share a draft. Only Save publishes the new configuration. */
 public final class SettingsScreen extends LinearLayout {
+  private static final String[] TRIP_FIELDS = {"station", "route", "routes", "direction", "tripDirection",
+      "directionsByRoute", "destination", "destinationId", "walk", "buffer"};
   public interface Listener {
     void save(JSONObject settings);
 
@@ -48,6 +50,7 @@ public final class SettingsScreen extends LinearLayout {
   private static final String[] TABS = {"Trip", "Display", "Sound", "Connection"};
   private final Listener listener;
   private final JSONObject draft;
+  private final TripChoices tripChoices;
   private JSONArray catalog;
   private final LinearLayout nav, body;
   private final ScrollView scroll;
@@ -57,17 +60,37 @@ public final class SettingsScreen extends LinearLayout {
   private String updateStatus = "Check for and download the latest signed release.";
   private boolean updateReady;
   private boolean updateBusy;
+  private Spinner destinationInput;
+  private List<String> destinationValues;
+  private List<String> destinationNames;
+  private boolean restoreServerFocus;
 
   public SettingsScreen(
       Context context, JSONArray stations, JSONObject current, Listener listener) {
+    this(context, stations, current, listener, null);
+  }
+
+  public SettingsScreen(
+      Context context, JSONArray stations, JSONObject current, Listener listener, JSONObject savedUiState) {
     super(context);
     this.listener = listener;
     this.catalog = stations;
+    this.tripChoices = new TripChoices(context);
     try {
-      draft = new JSONObject(current.toString());
+      JSONObject source = savedUiState != null && savedUiState.optJSONObject("draft") != null
+          ? savedUiState.optJSONObject("draft") : current;
+      draft = new JSONObject(source.toString());
     } catch (JSONException e) {
       throw new IllegalArgumentException("Invalid preferences", e);
     }
+    if (savedUiState != null) {
+      section = Math.max(0, Math.min(4, savedUiState.optInt("section", 0)));
+      restoreScrollY = Math.max(0, savedUiState.optInt("scrollY", 0));
+      restoreServerFocus = savedUiState.optBoolean("serverFocused");
+    }
+    JSONObject currentStation = selected();
+    if (currentStation != null && draft.optJSONObject("directionsByRoute") == null)
+      tripChoices.migrate(draft, currentStation);
     setOrientation(HORIZONTAL);
     setBackgroundColor(PAPER);
     LinearLayout rail = column();
@@ -91,14 +114,59 @@ public final class SettingsScreen extends LinearLayout {
     body.setFocusableInTouchMode(true);
     body.setPadding(dp(18), dp(12), dp(18), dp(20));
     scroll.addView(body);
-    usePhone = current.optString("server").isEmpty();
+    usePhone = savedUiState != null && savedUiState.has("usePhone")
+        ? savedUiState.optBoolean("usePhone") : draft.optString("server").isEmpty();
     draw();
+  }
+
+  private int restoreScrollY;
+
+  public JSONObject uiState() {
+    JSONObject state = new JSONObject();
+    try {
+      captureAddress();
+      captureTripFields();
+      state.put("draft", new JSONObject(draft.toString()));
+      state.put("section", section);
+      state.put("scrollY", scroll.getScrollY());
+      state.put("usePhone", usePhone);
+      state.put("serverFocused", serverInput != null && serverInput.hasFocus());
+    } catch (JSONException ignored) { }
+    return state;
+  }
+
+  public JSONObject draft() {
+    try { return new JSONObject(draft.toString()); }
+    catch (JSONException impossible) { return new JSONObject(); }
   }
 
   public void setStations(JSONArray stations) {
     captureAddress();
+    restoreScrollY = scroll.getScrollY();
     catalog = stations;
+    reconcileTripWithCatalog();
     draw();
+  }
+
+  private void reconcileTripWithCatalog() {
+    JSONObject station = selected();
+    if (station == null) return;
+    JSONArray offered = station.optJSONArray("routes");
+    JSONArray previous = selectedRoutes();
+    JSONObject mapped = tripChoices.directionsFor(station,
+        draft.optString("tripDirection", draft.optString("direction")), previous);
+    JSONArray retained = new JSONArray();
+    JSONObject keptDirections = new JSONObject();
+    for (int i = 0; i < previous.length(); i++) {
+      String route = previous.optString(i);
+      String direction = mapped.optString(route);
+      if (!contains(offered, route) || direction.isEmpty()) continue;
+      retained.put(route);
+      try { keptDirections.put(route, direction); } catch (JSONException ignored) { }
+    }
+    put("routes", retained);
+    put("route", retained.optString(0, ""));
+    put("directionsByRoute", keptDirections);
   }
 
   boolean showsDirectory(JSONArray list) {
@@ -135,10 +203,15 @@ public final class SettingsScreen extends LinearLayout {
   private void select(int tab) {
     captureAddress();
     section = tab;
+    restoreScrollY = 0;
     draw();
   }
 
   private void draw() {
+    captureTripFields();
+    destinationInput = null;
+    destinationValues = null;
+    destinationNames = null;
     serverInput = null;
     body.removeAllViews();
     nav.removeAllViews();
@@ -158,7 +231,7 @@ public final class SettingsScreen extends LinearLayout {
     nav.addView(control("Update app", INK, WHITE, () -> select(4)), new LayoutParams(-1, dp(48)));
     if (section == 4) {
       updatePage();
-      scroll.scrollTo(0, 0);
+      restoreScroll();
       return;
     }
     TextView title = label(TABS[section], 29, INK, true);
@@ -180,7 +253,13 @@ public final class SettingsScreen extends LinearLayout {
         connection();
         break;
     }
-    scroll.scrollTo(0, 0);
+    restoreScroll();
+  }
+
+  private void restoreScroll() {
+    final int y = restoreScrollY;
+    restoreScrollY = 0;
+    scroll.post(() -> scroll.scrollTo(0, y));
   }
 
   void setUpdateState(String status, boolean ready) {
@@ -200,10 +279,12 @@ public final class SettingsScreen extends LinearLayout {
     body.addView(rule, new LayoutParams(-1, dp(3)));
     body.addView(label("Update app", 29, INK, true));
     note(updateStatus);
-    if (!updateBusy) action(updateReady ? "Install update" : "Download latest update", () -> {
-        if (updateReady) listener.installUpdate();
-        else listener.downloadUpdate();
-      });
+    if (!updateBusy) {
+      if (updateReady) {
+        action("Install update", listener::installUpdate);
+        action("Check and download latest update", listener::downloadUpdate);
+      } else action("Download latest update", listener::downloadUpdate);
+    }
     if (updateReady) note("The Android installer will ask you to confirm the update.");
     if (android.os.Build.VERSION.SDK_INT < 26)
       note("Android 5.1: if Android blocks installation, open Settings → Security → Unknown sources, enable it, then try again.");
@@ -211,25 +292,166 @@ public final class SettingsScreen extends LinearLayout {
 
   private void trip() {
     JSONObject station = selected();
-    heading("Station");
+    namedTrips();
     String stationLabel =
         station == null
             ? "Choose a station"
             : station.optString("name") + "  ·  " + station.optString("line", station.optString("area"));
-    action(stationLabel + "   ›", this::stationPicker);
+    if (station != null && station.optJSONArray("routes") != null
+        && station.optJSONArray("routes").length() == 1) {
+      LinearLayout row = line();
+      body.addView(row, new LayoutParams(-1, dp(48)));
+      TextView stationButton = control(stationLabel + "   ›", SOFT, INK, this::stationPicker);
+      row.addView(stationButton, new LayoutParams(0, dp(48), 1));
+      String route = station.optJSONArray("routes").optString(0);
+      row.addView(routeChoice(route, contains(selectedRoutes(), route), () -> choose(station, route)),
+          new LayoutParams(dp(56), dp(48)));
+    } else {
+      heading("Station");
+      action(stationLabel + "   ›", this::stationPicker);
+    }
     if (station != null) {
-      heading("Lines");
-      choices(station.optJSONArray("routes"), "", true, station);
-      note("Choose one or more lines. Disabled lines do not board in the chosen direction.");
+      JSONArray routes = selectedRoutes();
       heading("Direction");
-      choices(
-          boardingDirections(station),
-          draft.optString("direction"),
-          false,
-          station);
+      choices(tripChoices.namedDirections(station), draft.optString("tripDirection", draft.optString("direction")), false, station);
+      if (station.optJSONArray("routes").length() > 1) {
+        heading("Lines");
+        choices(station.optJSONArray("routes"), "", true, station);
+      }
+      if (tripChoices.requiresSemanticDirection(station)
+          && !contains(tripChoices.namedDirections(station), draft.optString("tripDirection")))
+        note("Choose a direction to see eligible lines.");
+      if (routes.length() > 1 || tripChoices.requiresSemanticDirection(station)) {
+        String onward = tripChoices.onwardSummary(station, draft);
+        if (!onward.isEmpty()) note(onward);
+      }
     }
     stepper("Walk to the platform", "walk", 0, 90);
     stepper("Extra boarding time", "buffer", 0, 30);
+    if (station != null) destinationChoice(station);
+    action("Save this trip…", this::saveNamedTrip);
+  }
+
+  private void destinationChoice(JSONObject station) {
+    heading("Destination (optional)");
+    JSONArray terminals = tripChoices.destinationsFor(station, draft);
+    List<String> values = new ArrayList<>();
+    List<String> names = new ArrayList<>();
+    List<String> labels = new ArrayList<>();
+    values.add("");
+    names.add("");
+    labels.add("Any destination");
+    for (int i = 0; i < terminals.length(); i++) {
+      JSONObject terminal = terminals.optJSONObject(i);
+      if (terminal == null) continue;
+      values.add(terminal.optString("terminalId"));
+      names.add(terminal.optString("terminalName"));
+      labels.add(terminal.optString("terminalName"));
+    }
+    String savedId = draft.optString("destinationId");
+    String saved = draft.optString("destination");
+    int index = savedId.isEmpty() ? names.indexOf(saved) : values.indexOf(savedId);
+    if ((!savedId.isEmpty() || !saved.isEmpty()) && index < 1) {
+      values.add(savedId);
+      names.add(saved);
+      labels.add("(unlisted) " + saved);
+      index = values.size() - 1;
+    }
+    ArrayAdapter<String> adapter = new ArrayAdapter<>(getContext(), android.R.layout.simple_spinner_item, labels);
+    adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+    destinationValues = values;
+    destinationNames = names;
+    destinationInput = new Spinner(getContext());
+    destinationInput.setAdapter(adapter);
+    destinationInput.setSelection(Math.max(0, index));
+    body.addView(destinationInput, new LayoutParams(-1, dp(48)));
+    if (terminals.length() == 0) note("No scheduled destinations for this selection.");
+  }
+
+  private void namedTrips() {
+    JSONArray trips = draft.optJSONArray("namedTrips");
+    if (trips == null || trips.length() == 0) return;
+    heading("Saved trips");
+    LinearLayout strip = line();
+    HorizontalScrollView row = new HorizontalScrollView(getContext());
+    body.addView(row);
+    row.addView(strip);
+    for (int i = 0; i < trips.length(); i++) {
+      JSONObject trip = trips.optJSONObject(i);
+      if (trip == null) continue;
+      String name = trip.optString("name");
+      TextView button = control(name, SOFT, INK, () -> applyNamedTrip(trip));
+      strip.addView(button, new LayoutParams(-2, dp(48)));
+    }
+    action("Manage saved trips", this::manageNamedTrips);
+  }
+
+  private void manageNamedTrips() {
+    JSONArray trips = draft.optJSONArray("namedTrips");
+    if (trips == null || trips.length() == 0) return;
+    List<String> names = new ArrayList<>();
+    for (int i = 0; i < trips.length(); i++) {
+      JSONObject trip = trips.optJSONObject(i);
+      if (trip != null) names.add(trip.optString("name"));
+    }
+    new AlertDialog.Builder(getContext()).setTitle("Remove a saved trip")
+        .setItems(names.toArray(new String[0]), (dialog, index) -> {
+          JSONArray updated = new JSONArray();
+          for (int i = 0; i < trips.length(); i++) {
+            JSONObject trip = trips.optJSONObject(i);
+            if (trip != null && !names.get(index).equals(trip.optString("name"))) updated.put(trip);
+          }
+          put("namedTrips", updated);
+          draw();
+        }).setNegativeButton("Done", null).show();
+  }
+
+  private void applyNamedTrip(JSONObject trip) {
+    for (String key : TRIP_FIELDS) {
+      if (trip.has(key)) put(key, trip.opt(key));
+      else draft.remove(key);
+    }
+    JSONObject station = selected();
+    if (station != null) tripChoices.migrate(draft, station);
+    destinationInput = null;
+    draw();
+  }
+
+  private void saveNamedTrip() {
+    if (!requireTrip()) return;
+    EditText input = field("Trip name", "");
+    new AlertDialog.Builder(getContext()).setTitle("Save this trip")
+        .setView(input).setNegativeButton("Cancel", null)
+        .setPositiveButton("Save", (d, w) -> {
+          String name = input.getText().toString().trim();
+          if (name.isEmpty()) return;
+          captureTripFields();
+          JSONObject snapshot = new JSONObject();
+          try {
+            for (String key : TRIP_FIELDS)
+              if (draft.has(key)) snapshot.put(key, draft.opt(key));
+            JSONArray trips = draft.optJSONArray("namedTrips");
+            JSONArray updated = new JSONArray();
+            for (int i = 0; trips != null && i < trips.length(); i++) {
+              JSONObject old = trips.optJSONObject(i);
+              if (old != null && !name.equalsIgnoreCase(old.optString("name"))) updated.put(old);
+            }
+            snapshot.put("name", name);
+            updated.put(snapshot);
+            put("namedTrips", updated);
+            draw();
+          } catch (JSONException ignored) { }
+        }).show();
+  }
+
+  private void captureTripFields() {
+    if (destinationInput != null) {
+      int position = destinationInput.getSelectedItemPosition();
+      put("destinationId", destinationValues == null || position < 0 || position >= destinationValues.size()
+          ? "" : destinationValues.get(position));
+      put("destination", destinationNames == null || position < 1 || position >= destinationNames.size()
+          ? "" : destinationNames.get(position));
+    }
   }
 
   private JSONObject selected() {
@@ -258,6 +480,7 @@ public final class SettingsScreen extends LinearLayout {
   }
 
   private void choose(JSONObject station, String route) {
+    captureTripFields();
     put("station", station.optString("id"));
     JSONArray routes = selectedRoutes();
     if (contains(routes, route)) {
@@ -266,43 +489,65 @@ public final class SettingsScreen extends LinearLayout {
         if (!route.equals(routes.optString(i))) kept.put(routes.optString(i));
       routes = kept;
     } else {
-      if (!contains(directions(station, route), draft.optString("direction"))) return;
+      JSONObject allDirections = tripChoices.directionsFor(
+          station, draft.optString("tripDirection", draft.optString("direction")), station.optJSONArray("routes"));
+      String direction = allDirections.optString(route);
+      if (direction.isEmpty() || !contains(directions(station, route), direction)) return;
       routes.put(route);
     }
-    JSONArray compatible = compatibleRoutes(station, routes, draft.optString("direction"));
-    put("routes", compatible);
-    put("route", compatible.optString(0, ""));
+    put("routes", routes);
+    put("route", routes.optString(0, ""));
+    put("directionsByRoute", tripChoices.directionsFor(
+        station, draft.optString("tripDirection", draft.optString("direction")), routes));
+    clearUnavailableDestination(station);
+    destinationInput = null;
     draw();
   }
 
+  private void clearUnavailableDestination(JSONObject station) {
+    String destinationId = draft.optString("destinationId");
+    String destinationName = draft.optString("destination");
+    if (destinationId.isEmpty() && destinationName.isEmpty()) return;
+    JSONArray options = tripChoices.destinationsFor(station, draft);
+    for (int i = 0; i < options.length(); i++) {
+      JSONObject option = options.optJSONObject(i);
+      if (option != null && (!destinationId.isEmpty()
+          ? destinationId.equals(option.optString("terminalId"))
+          : destinationName.equalsIgnoreCase(option.optString("terminalName")))) return;
+    }
+    put("destination", "");
+    put("destinationId", "");
+  }
+
   private void chooseStation(JSONObject station) {
+    boolean changedStation = !station.optString("id").equals(draft.optString("station"));
+    captureTripFields();
+    destinationInput = null;
+    if (changedStation) { put("destination", ""); put("destinationId", ""); }
     put("station", station.optString("id"));
     JSONArray offered = station.optJSONArray("routes");
     JSONArray selected = selectedRoutes();
-    JSONArray compatible = compatibleRoutes(station, selected, draft.optString("direction"));
-    JSONArray onStation = new JSONArray();
-    for (int i = 0; i < compatible.length(); i++)
-      if (contains(offered, compatible.optString(i))) onStation.put(compatible.optString(i));
-    compatible = onStation;
-    if (compatible.length() == 0) {
-      String route = "";
-      for (int i = 0; offered != null && i < offered.length(); i++) {
-        String candidate = offered.optString(i);
-        if (contains(directions(station, candidate), draft.optString("direction"))) {
-          route = candidate;
-          break;
-        }
-      }
-      if (route.isEmpty() && offered != null && offered.length() > 0) {
-        route = offered.optString(0);
-        put("direction", directions(station, route).optString(0, ""));
-      }
-      if (!route.isEmpty()) {
-        compatible.put(route);
-      }
+    String named = draft.optString("tripDirection", draft.optString("direction"));
+    JSONArray choices = tripChoices.namedDirections(station);
+    if (!contains(choices, named)) {
+      String legacy = draft.optString("direction");
+      named = contains(choices, legacy) ? legacy : choices.length() == 1 ? choices.optString(0) : "";
     }
+    put("tripDirection", named);
+    JSONArray compatible;
+    if (tripChoices.requiresSemanticDirection(station)) {
+      JSONObject maps = tripChoices.directionsFor(station, named, selected);
+      compatible = new JSONArray();
+      for (int i = 0; i < selected.length(); i++)
+        if (maps.has(selected.optString(i))) compatible.put(selected.optString(i));
+    } else {
+      compatible = compatibleRoutes(station, selected, named);
+    }
+    if (compatible.length() == 0 && offered != null && offered.length() == 1)
+      compatible.put(offered.optString(0));
     put("routes", compatible);
     put("route", compatible.optString(0, ""));
+    put("directionsByRoute", tripChoices.directionsFor(station, named, compatible));
     draw();
   }
 
@@ -317,20 +562,6 @@ public final class SettingsScreen extends LinearLayout {
     String route = draft.optString("route");
     if (!route.isEmpty()) legacy.put(route);
     return legacy;
-  }
-
-  private JSONArray boardingDirections(JSONObject station) {
-    JSONArray result = new JSONArray();
-    String[] sides = {"N", "S"};
-    for (String side : sides) {
-      JSONArray routes = station.optJSONArray("routes");
-      for (int i = 0; routes != null && i < routes.length(); i++)
-        if (contains(directions(station, routes.optString(i)), side)) {
-          result.put(side);
-          break;
-        }
-    }
-    return result;
   }
 
   private JSONArray compatibleRoutes(JSONObject station, JSONArray selected, String direction) {
@@ -368,16 +599,24 @@ public final class SettingsScreen extends LinearLayout {
     scrollChoices.addView(strip);
     for (int i = 0; i < items.length(); i++) {
       String value = items.optString(i);
-      String title =
-          routes ? BoardView.routeName(value) : station.optJSONObject("directions").optString(value, value);
+      String title = routes ? BoardView.routeName(value) : tripChoices.label(station, value);
       boolean chosen = routes ? contains(selectedRoutes(), value) : active.equals(value);
       Runnable selectChoice = () -> {
         if (routes) choose(station, value);
         else {
-          JSONArray compatible = compatibleRoutes(station, selectedRoutes(), value);
+          captureTripFields();
+          put("tripDirection", value);
+          if (value.equals("N") || value.equals("S")) put("direction", value);
+          JSONObject mapping = tripChoices.directionsFor(station, value, selectedRoutes());
+          put("directionsByRoute", mapping);
+          JSONArray compatible = new JSONArray();
+          JSONArray selected = selectedRoutes();
+          for (int r = 0; r < selected.length(); r++)
+            if (mapping.has(selected.optString(r))) compatible.put(selected.optString(r));
           put("routes", compatible);
           put("route", compatible.optString(0, ""));
-          put("direction", value);
+          clearUnavailableDestination(station);
+          destinationInput = null;
           draw();
         }
       };
@@ -388,8 +627,8 @@ public final class SettingsScreen extends LinearLayout {
               chosen ? WHITE : INK,
               selectChoice);
       button.setSelected(chosen);
-      boolean directionAvailable = !routes
-          || contains(directions(station, value), draft.optString("direction"));
+      boolean directionAvailable = !routes || tripChoices.directionsFor(station, draft.optString("tripDirection"),
+          new JSONArray().put(value)).has(value);
       if (!directionAvailable) {
         button.setEnabled(false);
         button.setAlpha(.4f);
@@ -413,6 +652,7 @@ public final class SettingsScreen extends LinearLayout {
     badge.setFocusable(true);
     badge.setBackground(new android.graphics.drawable.RippleDrawable(
         android.content.res.ColorStateList.valueOf(0x44787878), shape(chosen ? INK : SOFT), null));
+    badge.setContentDescription(BoardView.routeName(route) + (chosen ? ", selected" : ", not selected"));
     badge.setOnClickListener(v -> action.run());
     return badge;
   }
@@ -443,7 +683,7 @@ public final class SettingsScreen extends LinearLayout {
     results.setAdapter(rows);
     Runnable filter =
         () -> {
-          String q = input.getText().toString().trim().toLowerCase(Locale.US);
+          String q = input.getText().toString().trim();
           List<String> labels = new ArrayList<>();
           matches.clear();
           for (int i = 0; i < catalog.length(); i++) {
@@ -463,7 +703,7 @@ public final class SettingsScreen extends LinearLayout {
                     + "   ·   "
                     + station.optString("area");
             if (!station.optString("line").isEmpty()) name += "   ·   " + station.optString("line");
-            if (!name.toLowerCase(Locale.US).contains(q)) continue;
+            if (!matchesStationQuery(q, name, routes)) continue;
             matches.add(station);
             labels.add(name);
           }
@@ -506,6 +746,30 @@ public final class SettingsScreen extends LinearLayout {
     dlg.getWindow().setLayout((int) (getResources().getDisplayMetrics().widthPixels * .91), -1);
   }
 
+  static boolean matchesStationQuery(String query, String fields, JSONArray routes) {
+    String normalized = normalizeSearch(query);
+    if (normalized.isEmpty()) return true;
+    String haystack = normalizeSearch(fields);
+    String[] words = normalized.split(" ");
+    for (String word : words) {
+      if (word.isEmpty()) continue;
+      boolean routeToken = false;
+      for (int i = 0; routes != null && i < routes.length(); i++)
+        if (normalizeSearch(BoardView.routeName(routes.optString(i))).equals(word)) routeToken = true;
+      boolean fieldToken = false;
+      for (String token : haystack.split(" ")) if (token.equals(word)) fieldToken = true;
+      if (!fieldToken && !routeToken) return false;
+    }
+    return true;
+  }
+
+  private static String normalizeSearch(String value) {
+    String text = value == null ? "" : value.toLowerCase(Locale.US).replaceAll("[^a-z0-9]+", " ").trim();
+    text = text.replaceAll("\\bsq\\b", "square").replaceAll("\\bst\\b", "street");
+    text = text.replaceAll("\\bave\\b", "avenue").replaceAll("\\bav\\b", "avenue");
+    return text.replaceAll("\\s+", " ");
+  }
+
   private void display() {
     toggle("Dim overnight", "dim");
     note("Lower brightness from 10 pm to 6 am, New York time.");
@@ -520,10 +784,10 @@ public final class SettingsScreen extends LinearLayout {
       return;
     }
     action("Test chime", listener::testChime);
-    toggle("Chime for each catchable train", "chimeRepeat");
+    toggle("Repeat for the next recommended train", "chimeRepeat");
     note(
         draft.optBoolean("chimeRepeat")
-            ? "Ping 2 minutes and 30 seconds before leaving for each train."
+            ? "Repeat both reminders for the next train recommended by the board."
             : "Ping 2 minutes and 30 seconds before leaving for one train per window.");
     heading("Days");
     LinearLayout days = line();
@@ -534,6 +798,7 @@ public final class SettingsScreen extends LinearLayout {
     for (int i = 0; i < 7; i++) {
       int mask = 1 << i;
       boolean on = (draft.optInt("days") & mask) != 0;
+      final TextView[] ref = new TextView[1];
       TextView day =
           control(
               names[i],
@@ -541,8 +806,12 @@ public final class SettingsScreen extends LinearLayout {
               on ? WHITE : INK,
               () -> {
                 put("days", draft.optInt("days") ^ mask);
-                draw();
+                boolean enabled = (draft.optInt("days") & mask) != 0;
+                ref[0].setSelected(enabled);
+                ref[0].setTextColor(enabled ? WHITE : INK);
+                ref[0].setBackground(shape(enabled ? INK : SOFT));
               });
+      ref[0] = day;
       day.setSelected(on);
       LayoutParams p = new LayoutParams(-2, dp(48));
       p.rightMargin = dp(4);
@@ -602,6 +871,11 @@ public final class SettingsScreen extends LinearLayout {
       serverInput = field("Host or IP address", draft.optString("server"));
       serverInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
       body.addView(serverInput, new LayoutParams(-1, dp(48)));
+      if (restoreServerFocus) {
+        restoreServerFocus = false;
+        serverInput.requestFocus();
+        serverInput.setSelection(serverInput.length());
+      }
       action("Test connection", () -> {
         if (requireAddress()) listener.loadStations(serviceAddress());
       });
@@ -621,6 +895,7 @@ public final class SettingsScreen extends LinearLayout {
 
   private void save() {
     captureAddress();
+    captureTripFields();
     if (!requireAddress()) return;
     if (draft.optBoolean("chime")
         && (draft.optInt("days") == 0 || draft.optInt("start") == draft.optInt("end"))) {
@@ -629,22 +904,26 @@ public final class SettingsScreen extends LinearLayout {
           .show();
       return;
     }
-    JSONObject station = selected();
-    JSONArray routes = station == null ? null : selectedRoutes();
-    boolean valid = station != null && routes != null && routes.length() > 0;
-    for (int i = 0; valid && i < routes.length(); i++)
-      valid = contains(station.optJSONArray("routes"), routes.optString(i))
-          && contains(directions(station, routes.optString(i)), draft.optString("direction"));
-    if (station == null
-        || !valid) {
-      select(0);
-      Toast.makeText(
-              getContext(), "Choose a station, line and boarding direction.", Toast.LENGTH_LONG)
-          .show();
-      return;
-    }
+    if (!requireTrip()) return;
     if (usePhone) put("server", "");
     listener.save(draft);
+  }
+
+  private boolean requireTrip() {
+    JSONObject station = selected();
+    JSONArray routes = selectedRoutes();
+    JSONObject expected = tripChoices.directionsFor(station, draft.optString("tripDirection"), routes);
+    boolean valid = station != null && routes.length() > 0;
+    for (int i = 0; valid && i < routes.length(); i++) {
+      String route = routes.optString(i);
+      valid = contains(station.optJSONArray("routes"), route) && expected.has(route)
+          && expected.optString(route).equals(TripChoices.platformDirection(draft, route));
+    }
+    if (!valid) {
+      select(0);
+      Toast.makeText(getContext(), "Choose a station, line and boarding direction.", Toast.LENGTH_LONG).show();
+    }
+    return valid;
   }
 
   private void toggle(String title, String key) {

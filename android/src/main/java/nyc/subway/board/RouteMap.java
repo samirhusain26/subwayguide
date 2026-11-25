@@ -8,6 +8,8 @@ import android.graphics.Shader;
 import android.graphics.Rect;
 import android.graphics.Paint;
 import android.graphics.Path;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuffXfermode;
 import android.graphics.RectF;
 import android.graphics.Typeface;
 import java.io.IOException;
@@ -15,6 +17,7 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Collections;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -23,6 +26,7 @@ final class RouteMap {
   interface Assets { InputStream open(String name) throws IOException; }
   static final float LEFT = 298, RIGHT = 640, BOTTOM = 248;
   private static final int INK = 0xff203a37, PAPER = 0xfffaf8ee;
+  private static JSONObject cachedNetwork;
   // Both washes use the board paper color. Their low-opacity ends keep the station
   // corridor crisp, while the near-opaque ends leave a trace of streets behind the type.
   private static final int WASH = BoardView.PAPER & 0x00ffffff;
@@ -36,26 +40,66 @@ final class RouteMap {
   private final Assets assets;
   private final JSONObject network;
   private final Paint pen = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+  private final Shader trackFade = new LinearGradient(0, 224, 0, 255,
+      new int[] {0xffffffff, 0x00ffffff}, new float[] {0, 1}, Shader.TileMode.CLAMP);
   private final List<RectF> labels = new ArrayList<>();
   private JSONArray stops, shape, station;
+  private JSONArray selectedPath;
+  private float[] clippedShape = new float[0];
+  private boolean representative;
+  private String selectedId = "", selectedRoute = "", selectedSide = "", selectedDestination = "", selectedOnward = "";
+  private String selectedTerminal = "";
+  private List<String> selectedOnwardStops = Collections.emptyList();
   private int index = -1, color;
   private float cx, cy, metres;
   private boolean wide;
 
   RouteMap(Assets assets) {
     this.assets = assets;
-    JSONObject loaded;
-    try (InputStream in = assets.open("nyc/network.json")) {
-      loaded = new JSONObject(ServiceClient.read(in));
-    } catch (Exception unavailable) {
-      loaded = new JSONObject();
+    network = loadNetwork(assets);
+  }
+
+  /** Returns the process-shared packaged schedule atlas; consumers treat it as immutable. */
+  static JSONObject loadNetwork(Assets assets) {
+    synchronized (RouteMap.class) {
+      if (cachedNetwork != null) return cachedNetwork;
+      try (InputStream in = assets.open("nyc/network.json")) {
+        cachedNetwork = new JSONObject(ServiceClient.read(in));
+      } catch (Exception unavailable) {
+        return new JSONObject();
+      }
+      return cachedNetwork;
     }
-    network = loaded;
+  }
+
+  RouteMap snapshot() {
+    RouteMap copy = new RouteMap(assets);
+    copy.select(selectedId, selectedRoute, selectedSide, selectedDestination, selectedOnward,
+        selectedOnwardStops, selectedTerminal);
+    return copy;
   }
 
   void select(String id, String route, String side, String destination, String onward) {
+    select(id, route, side, destination, onward, Collections.emptyList());
+  }
+
+  void select(String id, String route, String side, String destination, String onward,
+      List<String> onwardStops) {
+    select(id, route, side, destination, onward, onwardStops, "");
+  }
+
+  void select(String id, String route, String side, String destination, String onward,
+      List<String> onwardStops, String terminalId) {
+    if (onwardStops == null) onwardStops = Collections.emptyList();
+    selectedId = id; selectedRoute = route; selectedSide = side;
+    selectedDestination = destination; selectedOnward = onward;
+    selectedTerminal = terminalId == null ? "" : terminalId;
+    selectedOnwardStops = new ArrayList<>(onwardStops);
     index = -1;
     stops = shape = null;
+    selectedPath = null;
+    clippedShape = new float[0];
+    representative = false;
     JSONObject stations = network.optJSONObject("stations"), routes = network.optJSONObject("routes");
     station = stations == null ? null : stations.optJSONArray(id);
     JSONArray options = routes == null ? null : routes.optJSONArray(route);
@@ -65,6 +109,10 @@ final class RouteMap {
     // Break ties by scheduled frequency. Terminal stop names match the realtime service's
     // destination wording even when the scheduled trip headsign is abbreviated.
     int best = -1;
+    String bestContinuation = null;
+    boolean tiedDifferentContinuation = false;
+    boolean bestDownstreamComplete = false;
+    boolean bestTerminalComplete = false;
     for (int i = 0; i < options.length(); i++) {
       JSONArray pattern = options.optJSONArray(i);
       JSONArray path = pattern.optJSONArray(2);
@@ -72,16 +120,52 @@ final class RouteMap {
       JSONArray end = stations.optJSONArray(terminal.substring(0, terminal.length() - 1));
       boolean sameEnd = pattern.optString(1).equalsIgnoreCase(destination)
           || end.optString(0).equalsIgnoreCase(destination);
+        String selectedTerminalParent = selectedTerminal.replaceFirst("[NS]$", "");
+        String patternTerminalParent = terminal.replaceFirst("[NS]$", "");
+        boolean sameTerminal = selectedTerminal.isEmpty()
+            || selectedTerminalParent.equals(patternTerminalParent);
       for (int j = 0; j < path.length() - 1; j++) {
         if (!platform.equals(path.optString(j))) continue;
-        int score = (sameEnd ? 1 : 0) + (path.optString(j + 1).equals(onward) ? 2 : 0);
-        if (score <= best) continue;
+        boolean sameNext = path.optString(j + 1).equals(onward);
+        int downstreamMatches = 0;
+        boolean downstreamPrefix = onwardStops != null && !onwardStops.isEmpty();
+        if (downstreamPrefix) {
+          for (int k = 0; k < onwardStops.size(); k++) {
+            if (j + 1 + k >= path.length() || !path.optString(j + 1 + k).equals(onwardStops.get(k))) {
+              downstreamPrefix = false;
+              break;
+            }
+            downstreamMatches++;
+          }
+        }
+        int score = (sameTerminal ? 100000 : 0) + downstreamMatches * 100
+            + (sameNext ? 2 : 0) + (sameEnd ? 1 : 0);
+        if (score < best) continue;
+        StringBuilder continuation = new StringBuilder();
+        for (int k = j; k < path.length(); k++) continuation.append(path.optString(k)).append('/');
+        if (score == best) {
+          if (bestContinuation != null && !bestContinuation.equals(continuation.toString()))
+            tiedDifferentContinuation = true;
+          continue; // Patterns are stored in descending frequency; retain the first on a tie.
+        }
+        if (score > best) {
+          bestContinuation = continuation.toString();
+          tiedDifferentContinuation = false;
+          bestDownstreamComplete = !onwardStops.isEmpty() && downstreamPrefix
+              && downstreamMatches == onwardStops.size();
+          bestTerminalComplete = selectedTerminal.isEmpty() || sameTerminal;
+        }
         index = j;
         stops = path;
         shape = network.optJSONObject("shapes").optJSONArray(pattern.optString(0));
+        selectedPath = path;
         best = score;
-        if (best == 3) return;
       }
+    }
+    if (index >= 0) {
+      representative = tiedDifferentContinuation || (!onwardStops.isEmpty() && !bestDownstreamComplete)
+          || (!selectedTerminal.isEmpty() && !bestTerminalComplete);
+      clippedShape = clipGeometry(shape, selectedPath, stations);
     }
   }
 
@@ -92,11 +176,18 @@ final class RouteMap {
 
   String description() {
     if (index < 0) return "Scheduled route map unavailable.";
-    return "Scheduled stops. " + (index > 0 ? "Previous: " + stop(index - 1).optString(0) + ". " : "First stop. ")
+    return (representative ? "Representative scheduled route. " : "Scheduled stops. ")
+        + (index > 0 ? "Previous: " + stop(index - 1).optString(0) + ". " : "First stop. ")
         + "Selected: " + station.optString(0) + ". Next: " + stop(index + 1).optString(0) + ".";
   }
 
   boolean available() { return index >= 0; }
+  boolean representative() { return representative; }
+  float[] geometryEndpoints() {
+    if (clippedShape.length < 4) return new float[0];
+    return new float[] {clippedShape[0], clippedShape[1], clippedShape[clippedShape.length-2],
+        clippedShape[clippedShape.length-1]};
+  }
 
   void draw(Canvas c, boolean fullRoute) {
     wide = fullRoute && available();
@@ -114,9 +205,9 @@ final class RouteMap {
         minX = Math.min(minX, x); maxX = Math.max(maxX, x);
         minY = Math.min(minY, y); maxY = Math.max(maxY, y);
       }
-      if (wide && shape != null) {
-        for (int i = 0; i < shape.length(); i += 2) {
-          int x = shape.optInt(i), y = shape.optInt(i+1);
+      if (wide && clippedShape.length > 0) {
+        for (int i = 0; i < clippedShape.length; i += 2) {
+          int x = Math.round(clippedShape[i]), y = Math.round(clippedShape[i+1]);
           minX = Math.min(minX, x); maxX = Math.max(maxX, x);
           minY = Math.min(minY, y); maxY = Math.max(maxY, y);
         }
@@ -148,8 +239,12 @@ final class RouteMap {
       if (!wide) {
         if (index > 0) stopLabel(c, index - 1, false);
         stopLabel(c, index + 1, false);
+      } else if (stops.length() > 1) {
+        stopLabel(c, 0, false);
+        stopLabel(c, stops.length() - 1, false);
       }
     }
+    if (available()) reserveTrackCorridor();
     drawPlaces(c);
     pen.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
     pen.setTextSize(12);
@@ -157,7 +252,8 @@ final class RouteMap {
     pen.setColor(INK);
     c.drawText("NYC" + (area.isEmpty() || wide ? "  /  SUBWAY" : "  /  " + area), LEFT + 10, 22, pen);
     pen.setTextSize(10);
-    c.drawText(available() ? "Scheduled stops" : "Route map unavailable", LEFT + 10, 38, pen);
+    c.drawText(available() ? (representative ? "Representative scheduled route" : "Scheduled stops")
+        : "Route map unavailable", LEFT + 10, 38, pen);
     pen.setTextSize(12);
     if (available()) {
       String action = wide ? "Nearby stops" : "Full route";
@@ -186,7 +282,9 @@ final class RouteMap {
     int firstRow = Math.max(minRow, (int)Math.floor((cy + (bounds.top - BOTTOM/2) * metres) / span));
     pen.setColor(0xffffffff);
     for (int col = firstCol; col < maxCol && x(col * span) < bounds.right; col++) {
+      if (Thread.currentThread().isInterrupted()) return;
       for (int row = firstRow; row < maxRow && y(row * span) < bounds.bottom; row++) {
+        if (Thread.currentThread().isInterrupted()) return;
         try (InputStream in = assets.open("nyc/" + scale + "-" + col + "-" + row + ".png")) {
           Bitmap tile = BitmapFactory.decodeStream(in);
           if (tile == null) continue;
@@ -199,33 +297,47 @@ final class RouteMap {
   }
 
   private void drawTrack(Canvas c) {
+    int faded = c.saveLayer(LEFT, 0, RIGHT, BOTTOM + 8, null);
     Path line = new Path();
-    if (shape != null) {
-      for (int i = 0; i < shape.length(); i += 2) {
-        float px = x(shape.optInt(i)), py = y(shape.optInt(i + 1));
+    if (clippedShape.length > 0) {
+      for (int i = 0; i < clippedShape.length; i += 2) {
+        float px = x(clippedShape[i]), py = y(clippedShape[i + 1]);
         if (i == 0) line.moveTo(px, py); else line.lineTo(px, py);
       }
     }
     pen.setStrokeCap(Paint.Cap.ROUND);
     pen.setStrokeJoin(Paint.Join.ROUND);
     pen.setStyle(Paint.Style.STROKE);
-    pen.setStrokeWidth(wide ? 5 : 7);
+    pen.setStrokeWidth(wide ? 6 : 7);
     pen.setColor(PAPER); c.drawPath(line, pen);
-    pen.setStrokeWidth(wide ? 2.7f : 4); pen.setColor(color); c.drawPath(line, pen);
+    if (color == 0xfff6bc26) {
+      pen.setStrokeWidth(wide ? 4.8f : 5.6f);
+      pen.setColor(INK); c.drawPath(line, pen);
+    }
+    pen.setStrokeWidth(wide ? 3.2f : 4);
+    pen.setColor(color);
+    pen.setAlpha(wide ? 215 : 175); c.drawPath(line, pen); pen.setAlpha(255);
     pen.setStyle(Paint.Style.FILL);
     for (int i = 0; i < stops.length(); i++) {
       JSONArray s = stop(i);
       float px = x(s.optInt(1)), py = y(s.optInt(2));
 
-      float r = wide ? 1.6f : 4.1f;
-      pen.setColor(INK); c.drawCircle(px, py, r, pen);
+      if (i < index - 1 || i > index + 1) continue;
+      float r = wide ? 1.4f : 4.1f;
+      pen.setColor(0x99505050); c.drawCircle(px, py, r, pen);
       pen.setColor(PAPER); c.drawCircle(px, py, r * .63f, pen);
-      if (Math.abs(index-i) <= 1) labels.add(new RectF(px-r-2,py-r-2,px+r+2,py+r+2));
+      labels.add(new RectF(px-r-3,py-r-3,px+r+3,py+r+3));
     }
-    float px = x(station.optInt(1)), py = y(station.optInt(2));
-    pen.setColor(PAPER); c.drawCircle(px, py, 8, pen);
-    pen.setColor(INK); c.drawCircle(px, py, 6, pen);
-    pen.setColor(color); c.drawCircle(px, py, 3.7f, pen);
+    float selectedX = x(station.optInt(1)), selectedY = y(station.optInt(2));
+    pen.setColor(PAPER); c.drawCircle(selectedX, selectedY, 8, pen);
+    pen.setColor(INK); c.drawCircle(selectedX, selectedY, 6, pen);
+    pen.setColor(color); c.drawCircle(selectedX, selectedY, 3.7f, pen);
+    pen.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.DST_IN));
+    pen.setShader(trackFade);
+    c.drawRect(LEFT, 0, RIGHT, BOTTOM + 8, pen);
+    pen.setShader(null);
+    pen.setXfermode(null);
+    c.restoreToCount(faded);
   }
 
   private void stopLabel(Canvas c, int i, boolean selected) {
@@ -261,6 +373,15 @@ final class RouteMap {
     return false;
   }
 
+  private void reserveTrackCorridor() {
+    for (int i = 0; i + 3 < clippedShape.length; i += 2) {
+      float x1 = x(clippedShape[i]), y1 = y(clippedShape[i + 1]);
+      float x2 = x(clippedShape[i + 2]), y2 = y(clippedShape[i + 3]);
+      labels.add(new RectF(Math.min(x1, x2) - 7, Math.min(y1, y2) - 7,
+          Math.max(x1, x2) + 7, Math.max(y1, y2) + 7));
+    }
+  }
+
   private static final Object[][] PLACES = {
     {"Hudson River", -73.967, 40.818}, {"Central Park", -73.966, 40.782},
     {"East River", -73.957, 40.749}, {"Prospect Park", -73.969, 40.661},
@@ -284,6 +405,46 @@ final class RouteMap {
       pen.setColor(0xff496568);
       c.drawText(title, px-half, py, pen);
     }
+  }
+
+  /** Clips the original ordered GTFS shape to its first/last passenger stop coordinates. */
+  private static float[] clipGeometry(JSONArray raw, JSONArray path, JSONObject stations) {
+    if (raw == null || raw.length() < 4 || path == null || path.length() < 2) return new float[0];
+    JSONArray station = stations.optJSONArray(path.optString(0).replaceFirst("[NS]$", ""));
+    JSONArray endStation = stations.optJSONArray(path.optString(path.length() - 1).replaceFirst("[NS]$", ""));
+    if (station == null || endStation == null) return new float[0];
+    float[] source = new float[raw.length()];
+    for (int i = 0; i < raw.length(); i++) source[i] = (float)raw.optInt(i);
+    float[] start = closest(source, station.optInt(1), station.optInt(2));
+    float[] end = closest(source, endStation.optInt(1), endStation.optInt(2));
+    if (start == null || end == null) return new float[0];
+    if (start[0] > end[0]) {
+      float[] swap = start; start = end; end = swap;
+    }
+    List<Float> result = new ArrayList<>();
+    result.add(start[1]); result.add(start[2]);
+    int firstVertex = (int)Math.floor(start[0]) + 1;
+    int lastVertex = (int)Math.ceil(end[0]);
+    for (int vertex = firstVertex; vertex < lastVertex; vertex++) {
+      result.add(source[vertex * 2]); result.add(source[vertex * 2 + 1]);
+    }
+    result.add(end[1]); result.add(end[2]);
+    float[] clipped = new float[result.size()];
+    for (int i = 0; i < result.size(); i++) clipped[i] = result.get(i);
+    return clipped;
+  }
+
+  private static float[] closest(float[] xy, float px, float py) {
+    float best = Float.MAX_VALUE;
+    float[] hit = null;
+    for (int i = 0; i + 3 < xy.length; i += 2) {
+      float ax = xy[i], ay = xy[i+1], dx = xy[i+2]-ax, dy = xy[i+3]-ay;
+      float length = dx*dx + dy*dy;
+      float t = length == 0 ? 0 : Math.max(0, Math.min(1, ((px-ax)*dx + (py-ay)*dy) / length));
+      float x = ax + t*dx, y = ay + t*dy, distance = (px-x)*(px-x)+(py-y)*(py-y);
+      if (distance < best) { best = distance; hit = new float[] {i / 2f + t, x, y}; }
+    }
+    return hit;
   }
 
   private void chip(Canvas c, float left, float base, String text) {

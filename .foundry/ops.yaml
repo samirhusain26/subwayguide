@@ -1,0 +1,24 @@
+schema_version: 1
+project: subwayguide
+name: Subway Board
+visibility: private
+risk_tier: standard
+stack: [android, java, python]
+source_of_truth:
+  decisions: README.md
+  hardware_context: true
+verify:
+  use_dev_storage: true
+  quick:
+    - "uv run --no-project --python 3.11 -- bash android/tests/run.sh"
+    - "uv run --python 3.11 --with-requirements server/requirements.txt python -m unittest discover -s server"
+  full:
+    - "uv run --no-project --python 3.11 -- bash android/tests/run.sh"
+    - "uv run --python 3.11 --with-requirements server/requirements.txt python -m unittest discover -s server"
+    - "uv run --python 3.11 --with 'pyshp<3' --with Pillow python -m unittest discover -s tools"
+    - "uv run --no-project --python 3.11 -- bash docs/qa/host/run.sh"
+distribution:
+  enabled: false
+  channels: []
+guardrails:
+  - "Use fixture data for deterministic verification and preserve the established release signing certificate."

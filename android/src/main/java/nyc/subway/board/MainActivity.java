@@ -22,6 +22,9 @@ import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.HashSet;
 import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.Future;
 import java.util.Set;
 import java.util.TimeZone;
 import java.util.concurrent.ExecutorService;
@@ -39,7 +42,11 @@ public final class MainActivity extends Activity {
   private static volatile MainActivity updateActivity;
   private static final AtomicBoolean UPDATE_DOWNLOADING = new AtomicBoolean();
   static final AtomicBoolean UPDATE_INSTALLING = new AtomicBoolean();
-  private final List<RouteSnapshot> routeSnapshots = new ArrayList<>();
+  private final Map<String, JSONObject> routeSnapshots = new LinkedHashMap<>();
+  private final Set<String> rejectedRoutes = new HashSet<>();
+  private Future<?> pollTask;
+  private ServiceClient.Poll activePoll;
+  private TripChoices tripChoices;
   private SharedPreferences prefs;
   private JSONObject config;
   private JSONArray stations, bundled, testedCatalog;
@@ -50,19 +57,9 @@ public final class MainActivity extends Activity {
   private ToneGenerator tone;
   private Decision previous;
   private long receivedAt, referenceTime, nextRequest;
-  private int generation, catalogRequest, failures;
+  private volatile int generation;
+  private int catalogRequest, failures;
   private boolean resumed, pending, disconnected, invalidSelection, invalidData;
-
-  private static final class RouteSnapshot {
-    final String route;
-    final JSONObject payload;
-    final long requestStarted;
-    RouteSnapshot(String route, JSONObject payload, long requestStarted) {
-      this.route = route;
-      this.payload = payload;
-      this.requestStarted = requestStarted;
-    }
-  }
 
   @Override
   public void onCreate(Bundle state) {
@@ -71,16 +68,16 @@ public final class MainActivity extends Activity {
     config = defaults();
     try {
       JSONObject saved = new JSONObject(prefs.getString("settings", "{}"));
-      java.util.Iterator<String> keys = config.keys();
+      java.util.Iterator<String> keys = saved.keys();
       while (keys.hasNext()) {
         String key = keys.next();
-        if (saved.has(key)) config.put(key, saved.get(key));
+        config.put(key, saved.get(key));
       }
       if (!saved.has("routes")) config.put("routes", new JSONArray().put(config.optString("route", "1")));
     } catch (JSONException ignored) {
       /* Safe defaults recover invalid old data. */
     }
-    try (InputStream input = getAssets().open("stations.json")) {
+    try (InputStream input = LocalBoard.openAsset(this, "stations.json")) {
       stations = new JSONObject(ServiceClient.read(input)).getJSONArray("stations");
       bundled = stations;
       String cached =
@@ -94,11 +91,18 @@ public final class MainActivity extends Activity {
     } catch (Exception ex) {
       if (stations == null) stations = new JSONArray();
     }
+    tripChoices = new TripChoices(this);
+    tripChoices.migrate(config, station());
     board = new BoardView(this, this::showSettings);
     setContentView(board);
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
     setVolumeControlStream(AudioManager.STREAM_NOTIFICATION);
+    if (state != null && state.containsKey("settingsUi")) {
+      try {
+        showSettings(new JSONObject(state.getString("settingsUi")));
+      } catch (JSONException ignored) { /* A corrupt draft never overwrites a saved trip. */ }
+    }
   }
 
   private static boolean isDirectory(JSONArray list) {
@@ -153,10 +157,15 @@ public final class MainActivity extends Activity {
   }
 
   @Override
+  protected void onSaveInstanceState(Bundle state) {
+    super.onSaveInstanceState(state);
+    if (editor != null) state.putString("settingsUi", editor.uiState().toString());
+  }
+
+  @Override
   protected void onResume() {
     super.onResume();
     updateActivity = this;
-    UPDATE_INSTALLING.set(false);
     resumed = true;
     restart();
     if (editor != null) refreshUpdateState();
@@ -165,7 +174,7 @@ public final class MainActivity extends Activity {
   @Override
   protected void onPause() {
     resumed = false;
-    generation++;
+    cancelPoll();
     handler.removeCallbacks(tick);
     previous = null;
     super.onPause();
@@ -197,8 +206,17 @@ public final class MainActivity extends Activity {
                 : View.SYSTEM_UI_FLAG_FULLSCREEN);
   }
 
-  private void restart() {
+  private void cancelPoll() {
     generation++;
+    if (pollTask != null) pollTask.cancel(true);
+    if (activePoll != null) activePoll.cancel();
+    activePoll = null;
+    pollTask = null;
+    pending = false;
+  }
+
+  private void restart() {
+    cancelPoll();
     pending = false;
     previous = null;
     response = null;
@@ -207,6 +225,7 @@ public final class MainActivity extends Activity {
     invalidData = false;
     failures = 0;
     routeSnapshots.clear();
+    rejectedRoutes.clear();
     nextRequest = 0;
     handler.removeCallbacks(tick);
     if (resumed && editor == null) tick.run();
@@ -229,33 +248,45 @@ public final class MainActivity extends Activity {
     final int request = generation;
     final JSONObject selection = config;
     pending = true;
-    network.execute(
+    final ServiceClient.Poll transport = new ServiceClient.Poll();
+    activePoll = transport;
+    pollTask = network.submit(
         () -> {
-          List<RouteSnapshot> snapshots = new ArrayList<>();
-          boolean badSelection = false;
+          Map<String, JSONObject> received = new LinkedHashMap<>();
+          Set<String> rejected = new HashSet<>();
           boolean malformed = false;
-          JSONArray selectedRoutes = selectedRoutes(selection);
-          for (int i = 0; i < selectedRoutes.length(); i++) {
-            String route = selectedRoutes.optString(i);
+          long lastResponseAt = 0;
+          JSONObject latest = null;
+          JSONArray routes = selectedRoutes(selection);
+          for (int i = 0; i < routes.length(); i++) {
+            if (request != generation || Thread.currentThread().isInterrupted()) return;
+            String route = routes.optString(i);
+            String platform = TripChoices.platformDirection(selection, route);
+            if (platform.isEmpty()) {
+              rejected.add(route);
+              continue;
+            }
             try {
-              long requestStarted = SystemClock.elapsedRealtime();
               JSONObject payload = selection.optString("server").isEmpty()
-                  ? LocalBoard.board(getApplicationContext(), selection.getString("station"),
-                      route, selection.getString("direction"))
-                  : ServiceClient.board(selection, route);
+                  ? LocalBoard.board(getApplicationContext(), selection.getString("station"), route, platform)
+                  : ServiceClient.board(selection, route, platform, transport);
+              long receipt = SystemClock.elapsedRealtime();
               validateBoard(payload);
-              snapshots.add(new RouteSnapshot(route, payload, requestStarted));
+              received.put(route, payload);
+              lastResponseAt = receipt;
+              latest = payload;
             } catch (JSONException e) {
               malformed = true;
             } catch (ServiceClient.UnknownSelection e) {
-              badSelection = true;
+              rejected.add(route);
             } catch (Exception | LinkageError ignored) {
-              // One route can be offline while another route still has safe live predictions.
+              // A temporary failure remains eligible for the next poll.
             }
           }
-          final boolean invalid = badSelection && snapshots.isEmpty();
-          final boolean invalidPayload = malformed && snapshots.isEmpty();
-          final List<RouteSnapshot> received = snapshots;
+          final boolean invalid = routes.length() == 0 || rejected.size() == routes.length();
+          final boolean invalidPayload = malformed && received.isEmpty();
+          final long receipt = lastResponseAt;
+          final JSONObject last = latest;
           handler.post(
               () -> {
                 if (request != generation || !resumed) return;
@@ -263,22 +294,20 @@ public final class MainActivity extends Activity {
                 invalidSelection = invalid;
                 invalidData = invalidPayload;
                 disconnected = received.isEmpty();
+                rejectedRoutes.clear();
+                rejectedRoutes.addAll(rejected);
+                routeSnapshots.clear();
+                routeSnapshots.putAll(received);
                 if (disconnected) {
                   previous = null;
+                  response = null;
                   failures = Math.min(failures + 1, 4);
                 } else {
                   if (failures > 0) previous = null;
                   failures = 0;
-                  routeSnapshots.clear();
-                  routeSnapshots.addAll(received);
-                  response = received.get(0).payload;
-                  if (selection.optString("server").isEmpty()) {
-                    referenceTime = System.currentTimeMillis() / 1000;
-                    receivedAt = SystemClock.elapsedRealtime();
-                  } else {
-                    referenceTime = response.optLong("serverTime");
-                    receivedAt = received.get(0).requestStarted;
-                  }
+                  response = last;
+                  referenceTime = last.optLong("serverTime");
+                  receivedAt = receipt;
                 }
                 long retryMs = failures == 0 ? 15000 : Math.min(60000, 5000L << (failures - 1));
                 nextRequest = SystemClock.elapsedRealtime() + retryMs;
@@ -315,8 +344,8 @@ public final class MainActivity extends Activity {
     List<String> selected = new ArrayList<>();
     JSONArray selectedArray = selectedRoutes(config);
     for (int i = 0; i < selectedArray.length(); i++) selected.add(selectedArray.optString(i));
-    for (RouteSnapshot snapshot : routeSnapshots) {
-      JSONObject payload = snapshot.payload;
+    for (Map.Entry<String, JSONObject> snapshot : routeSnapshots.entrySet()) {
+      JSONObject payload = snapshot.getValue();
       String status = payload.optString("status");
       if (!MultiRoutePolicy.fresh(now, payload.optLong("feedTime"), status)
           || "disrupted".equals(status)
@@ -325,67 +354,45 @@ public final class MainActivity extends Activity {
       for (int i = 0; arrivals != null && i < arrivals.length(); i++) {
         JSONObject train = arrivals.optJSONObject(i);
         if (train == null || train.optLong("time") <= 0) continue;
+        if (train.has("validUntil") && now > train.optLong("validUntil", 0)) continue;
+        if (!TripChoices.acceptsDestination(config, train)) continue;
         String rawId = train.opt("id") instanceof String ? train.optString("id") : "";
         String actualRoute = train.isNull("route") ? "" : train.optString("route", "");
-        if (actualRoute.isEmpty()) actualRoute = snapshot.route;
-        if (!MultiRoutePolicy.snapshotMaySupplyTrain(selected, snapshot.route, actualRoute)) continue;
+        if (actualRoute.isEmpty()) actualRoute = snapshot.getKey();
+        if (!MultiRoutePolicy.snapshotMaySupplyTrain(selected, snapshot.getKey(), actualRoute)) continue;
+        if (adviceOnly && !actualRoute.equals(snapshot.getKey())
+            && !payload.optBoolean("actualRouteNoticesChecked")) continue;
         String key = MultiRoutePolicy.identityKey(actualRoute, rawId);
         if (!rawId.trim().isEmpty() && !identities.add(key)) continue;
         result.add(new Decision.Train(rawId, train.optLong("time"),
             train.isNull("destination") ? "" : train.optString("destination"),
-            actualRoute, train.optString("onward")));
+            actualRoute, train.optString("onward"), downstream(train.optJSONArray("onwardStops")),
+            train.isNull("terminalId") ? "" : train.optString("terminalId")));
       }
     }
     return result;
   }
 
-  private boolean hasFreshRoute(long now) {
-    for (RouteSnapshot snapshot : routeSnapshots)
-      if (MultiRoutePolicy.fresh(now, snapshot.payload.optLong("feedTime"),
-          snapshot.payload.optString("status"))) return true;
-    return false;
-  }
-
-  private boolean hasSafeRoute(long now) {
-    for (RouteSnapshot snapshot : routeSnapshots) {
-      JSONObject payload = snapshot.payload;
-      if (MultiRoutePolicy.fresh(now, payload.optLong("feedTime"), payload.optString("status"))
-          && payload.optBoolean("noticesReady", false)) return true;
-    }
-    return false;
+  private static List<String> downstream(JSONArray ids) {
+    if (ids == null) return java.util.Collections.emptyList();
+    List<String> stops = new ArrayList<>();
+    for (int i = 0; i < ids.length(); i++)
+      if (ids.opt(i) instanceof String) stops.add(ids.optString(i));
+    return stops;
   }
 
   private String combinedAlert() {
     StringBuilder value = new StringBuilder();
     Set<String> seen = new HashSet<>();
-    for (RouteSnapshot snapshot : routeSnapshots) {
-      if (snapshot.payload.isNull("alert")) continue;
-      String alert = snapshot.payload.optString("alert").trim();
+    for (JSONObject payload : routeSnapshots.values()) {
+      if (payload.isNull("alert")) continue;
+      String alert = payload.optString("alert").trim();
       if (!alert.isEmpty() && seen.add(alert)) {
         if (value.length() > 0) value.append(" · ");
         value.append(alert);
       }
     }
     return value.toString();
-  }
-
-  private boolean allRoutesDisrupted() {
-    JSONArray selected = selectedRoutes(config);
-    if (routeSnapshots.isEmpty() || routeSnapshots.size() != selected.length()) return false;
-    for (RouteSnapshot snapshot : routeSnapshots)
-      if (!"disrupted".equals(snapshot.payload.optString("status"))) return false;
-    return true;
-  }
-
-  private boolean routesIncomplete(long now) {
-    JSONArray selected = selectedRoutes(config);
-    if (routeSnapshots.size() < selected.length()) return true;
-    for (RouteSnapshot snapshot : routeSnapshots) {
-      String status = snapshot.payload.optString("status");
-      if ("disrupted".equals(status)) continue;
-      if (!MultiRoutePolicy.fresh(now, snapshot.payload.optLong("feedTime"), status)) return true;
-    }
-    return false;
   }
 
   private JSONObject station() {
@@ -401,8 +408,7 @@ public final class MainActivity extends Activity {
     JSONObject s = station();
     String route = config.optString("route"), side = config.optString("direction");
     String name = s.optString("name", config.optString("station"));
-    JSONObject labels = s.optJSONObject("directions");
-    String direction = labels == null ? side : labels.optString(side, side);
+    String direction = tripChoices.label(s, config.optString("tripDirection", side));
     JSONArray lines = selectedRoutes(config);
     if (lines.length() > 1) {
       StringBuilder subtitle = new StringBuilder(direction).append(" · ");
@@ -424,6 +430,7 @@ public final class MainActivity extends Activity {
     adjustBrightness(now);
     String headline, detail, next = "", weatherKind = "", weather = "", alert = "";
     Decision guidance = null;
+    String qualifier = "", platformArrivals = "", consideredLines = "";
     boolean onPhone = config.optString("server").isEmpty();
     if (invalidSelection) {
       headline = "Choose a trip";
@@ -433,6 +440,8 @@ public final class MainActivity extends Activity {
       detail = "The service returned an unreadable update. Retrying automatically.";
     } else if (disconnected || response == null) {
       headline = disconnected ? "Service offline" : "Finding trains";
+      if (disconnected && lines.length() > 1)
+        qualifier = new RouteCoverage(lines, routeSnapshots, rejectedRoutes, now).qualifier();
       if (onPhone)
         detail = disconnected ? "Check the phone’s Wi-Fi. Trying again automatically."
             : "Getting arrivals over Wi-Fi…";
@@ -440,23 +449,32 @@ public final class MainActivity extends Activity {
         detail = disconnected ? "Check Wi-Fi and the address in Connection. Trying again automatically."
             : "Connecting to your home server…";
     } else {
-      boolean fresh = hasFreshRoute(now);
-      boolean noticesReady = hasSafeRoute(now);
-      List<Decision.Train> visibleTrains = trainsFor(now, noticesReady);
+      RouteCoverage coverage = new RouteCoverage(lines, routeSnapshots, rejectedRoutes, now);
+      boolean fresh = coverage.fresh;
+      boolean noticesReady = coverage.ready;
+      qualifier = coverage.qualifier();
+      consideredLines = android.text.TextUtils.join(", ", coverage.considered);
+      List<Decision.Train> candidates = trainsFor(now, noticesReady);
       Decision d =
           Decision.evaluate(
               now,
               fresh ? now : response.optLong("feedTime", 0),
               fresh ? "ok" : response.optString("status"),
-              visibleTrains,
+              candidates,
               config.optInt("walk"),
               config.optInt("buffer"));
       headline = d.headline;
       detail = d.detail;
       next = d.next;
-      boolean incomplete = routesIncomplete(now);
-      if (incomplete && fresh)
-        detail += " Some selected lines have no current data.";
+      boolean unconfirmedExpress = false;
+      if (fresh && (!noticesReady || d.targetTime == 0)) {
+        List<Decision.Train> platform = trainsFor(now, false);
+        Decision display = Decision.evaluate(now, now, "ok", platform,
+            config.optInt("walk"), config.optInt("buffer"));
+        platformArrivals = display.next;
+        next = platformArrivals;
+        unconfirmedExpress = noticesReady && coverage.pending.isEmpty() && display.targetTime > 0;
+      }
       if (!d.live && response.optLong("feedTime") > 0) {
         java.text.DateFormat format = new java.text.SimpleDateFormat("h:mm a", java.util.Locale.US);
         format.setTimeZone(TimeZone.getTimeZone("America/New_York"));
@@ -466,8 +484,8 @@ public final class MainActivity extends Activity {
       }
       JSONObject forecast = response.optJSONObject("weather");
       if (forecast == null) {
-        for (RouteSnapshot snapshot : routeSnapshots) {
-          forecast = snapshot.payload.optJSONObject("weather");
+        for (JSONObject payload : routeSnapshots.values()) {
+          forecast = payload.optJSONObject("weather");
           if (forecast != null) break;
         }
       }
@@ -493,23 +511,53 @@ public final class MainActivity extends Activity {
         }
       }
       alert = combinedAlert();
-      if (!noticesReady && allRoutesDisrupted()) {
+      if (!noticesReady && coverage.allDisrupted) {
         headline = "Service change";
         detail = "Boarding is affected at this platform.";
         next = "";
       }
-      if (d.live && !noticesReady) {
+      boolean awaitingNotices = !noticesReady || unconfirmedExpress || (!coverage.pending.isEmpty() && d.targetTime == 0);
+      if (d.live && awaitingNotices) {
         headline = "Checking service";
-        detail = "Waiting for service notices before giving a leave time.";
+        detail = unconfirmedExpress ? "Update the home server to confirm express service."
+            : "Waiting for service notices before giving a leave time.";
       }
-      if (noticesReady && d.live) {
+      if (d.live && d.targetTime == 0 && !qualifier.isEmpty() && headline.equals("No upcoming trains"))
+        headline = "No confirmed trains";
+      String destination = config.optString("destination").trim();
+      if (!destination.isEmpty() && d.live && (headline.equals("No upcoming trains") || headline.equals("No confirmed trains"))) {
+        headline = "No confirmed trains";
+        boolean reportsTerminals = false;
+        for (JSONObject snapshot : routeSnapshots.values())
+          reportsTerminals |= snapshot.optBoolean("terminalEvidenceSupported");
+        detail = onPhone || reportsTerminals ? "Waiting for a train confirmed to " + destination + "."
+            : "Update the home server to confirm trains to " + destination + ".";
+      }
+      if (d.live && !awaitingNotices) {
         guidance = d;
         maybeChime(d, now);
       }
-      previous = d.live && noticesReady ? d : null;
+      previous = guidance;
     }
+    List<String> onwardStops = java.util.Collections.emptyList();
+    if (guidance != null && guidance.primary != null) {
+      onwardStops = guidance.primary.onwardStops;
+      String platform = boardingSide(guidance.primary.route);
+      if (!platform.isEmpty()) side = platform;
+    } else {
+      String platform = TripChoices.platformDirection(config, route);
+      if (!platform.isEmpty()) side = platform;
+    }
+    board.updateContext(qualifier, platformArrivals, config.optInt("walk"), config.optInt("buffer"), onwardStops, consideredLines);
     board.update(config.optString("station"), name, route, side, direction, headline, detail, next,
         weatherKind, weather, alert, reduced, guidance, now);
+  }
+
+  private String boardingSide(String actualRoute) {
+    String platform = TripChoices.platformDirection(config, actualRoute);
+    if (platform.isEmpty() && actualRoute.endsWith("X"))
+      platform = TripChoices.platformDirection(config, actualRoute.substring(0, actualRoute.length() - 1));
+    return platform;
   }
 
   private void maybeChime(Decision current, long now) {
@@ -520,7 +568,7 @@ public final class MainActivity extends Activity {
         config.optInt("end"));
     if (window == null) return;
     String target = config.optString("station") + "/" + current.targetRoute + "/"
-        + config.optString("direction") + "/" + current.targetId;
+        + boardingSide(current.targetRoute) + "/" + current.targetId;
     boolean sameWindow = window.equals(prefs.getString("lastWindow", ""));
     if (!config.optBoolean("chimeRepeat") && sameWindow
         && !target.equals(prefs.getString("soundOwner", ""))) return;
@@ -563,7 +611,11 @@ public final class MainActivity extends Activity {
   }
 
   private void showSettings() {
-    generation++;
+    showSettings(null);
+  }
+
+  private void showSettings(JSONObject savedUi) {
+    cancelPoll();
     handler.removeCallbacks(tick);
     previous = null;
     testedOrigin = null;
@@ -645,13 +697,14 @@ public final class MainActivity extends Activity {
               public void installUpdate() {
                 beginUpdateInstall();
               }
-            });
+            }, savedUi);
     immersive(false);
     adjustBrightness(System.currentTimeMillis() / 1000);
     setContentView(editor);
     refreshUpdateState();
-    String savedOrigin = config.optString("server");
-    refreshCatalog(savedOrigin, true);
+    try {
+      refreshCatalog(editor.draft().optString("server"), true);
+    } catch (IllegalArgumentException ignored) { /* The rider can finish editing the address. */ }
   }
 
   private File updateApk() {
@@ -664,7 +717,7 @@ public final class MainActivity extends Activity {
       editor.setUpdateState("Downloading the latest update…", false, true);
       return;
     }
-    if (UPDATE_INSTALLING.get()) {
+    if (UpdateInstaller.active(this)) {
       editor.setUpdateState("Android is processing the update. Finish or cancel the installer before trying again.", false, true);
       return;
     }
@@ -677,11 +730,12 @@ public final class MainActivity extends Activity {
       String message;
       boolean ready;
       try {
-        UpdateInstaller.validate(getApplicationContext(), apk);
+        android.content.pm.PackageInfo candidate = UpdateInstaller.validate(getApplicationContext(), apk);
         ready = true;
-        message = "The latest update is downloaded and ready to install.";
+        message = "Version " + UpdateInstaller.label(candidate) + " is ready to install.";
       } catch (Exception invalid) {
         ready = false;
+        if (invalid instanceof IllegalArgumentException || invalid instanceof SecurityException) apk.delete();
         message = invalid.getMessage() == null ? "Download the latest signed release." : invalid.getMessage();
       }
       final String status = message;
@@ -689,14 +743,14 @@ public final class MainActivity extends Activity {
       UPDATE_HANDLER.post(() -> {
         MainActivity current = updateActivity;
         if (current != null && current.editor != null && !current.isDestroyed()
-            && !UPDATE_DOWNLOADING.get() && !UPDATE_INSTALLING.get())
+            && !UPDATE_DOWNLOADING.get() && !UpdateInstaller.active(current))
           current.editor.setUpdateState(status, installable);
       });
     });
   }
 
   private void startUpdateDownload() {
-    if (UPDATE_INSTALLING.get()) {
+    if (UpdateInstaller.active(this)) {
       if (editor != null) editor.setUpdateState("Android is processing the update. Finish or cancel the installer before trying again.", false, true);
       return;
     }
@@ -710,14 +764,21 @@ public final class MainActivity extends Activity {
     UPDATE_EXECUTOR.execute(() -> {
       String status;
       boolean ready = false;
+      File incoming = new File(destination.getParentFile(), "candidate.apk");
       try {
-        LocalBoard.downloadUpdate(app, destination);
-        UpdateInstaller.validate(app, destination);
+        LocalBoard.downloadUpdate(app, incoming);
+        android.content.pm.PackageInfo candidate = UpdateInstaller.promote(app, incoming, destination);
         ready = true;
-        status = "The latest update is downloaded and ready to install.";
+        status = "Version " + UpdateInstaller.label(candidate) + " is ready to install.";
       } catch (Exception failure) {
         status = failure.getMessage() == null ? "The update could not be downloaded. Try again." : failure.getMessage();
+        try {
+          android.content.pm.PackageInfo cached = UpdateInstaller.validate(app, destination);
+          status += " Saved version " + UpdateInstaller.label(cached) + " is still available.";
+          ready = true;
+        } catch (Exception noValidCache) { /* Leave the download action available. */ }
       } finally {
+        incoming.delete();
         UPDATE_DOWNLOADING.set(false);
       }
       final String message = status;
@@ -760,7 +821,7 @@ public final class MainActivity extends Activity {
       }
       return;
     }
-    if (!UPDATE_INSTALLING.compareAndSet(false, true)) {
+    if (UpdateInstaller.active(this) || !UPDATE_INSTALLING.compareAndSet(false, true)) {
       if (editor != null) editor.setUpdateState("Android is already processing this update.", false, true);
       return;
     }
@@ -773,6 +834,7 @@ public final class MainActivity extends Activity {
         UpdateInstaller.install(app, apk, apk.length());
       } catch (Exception failure) {
         error = failure.getMessage() == null ? "The update could not be prepared. Try again." : failure.getMessage();
+      } finally {
         UPDATE_INSTALLING.set(false);
       }
       final String message = error;
@@ -839,7 +901,7 @@ public final class MainActivity extends Activity {
         JSONArray directions = service == null ? null : service.optJSONArray(routes.optString(r));
         boolean served = false;
         for (int j = 0; directions != null && j < directions.length(); j++)
-          served |= settings.optString("direction").equals(directions.optString(j));
+          served |= TripChoices.platformDirection(settings, routes.optString(r)).equals(directions.optString(j));
         if (!served) return false;
       }
       return true;

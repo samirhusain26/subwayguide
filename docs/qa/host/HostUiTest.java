@@ -247,7 +247,8 @@ public class HostUiTest {
             Decision d = Decision.evaluate(now, now, "ok", predictions, 10, 1);
             board.update(id, name, route, directions.getString(j), label, d.headline, d.detail, d.next, "", "", "", true, d, now);
             String spoken = board.getChildAt(0).getContentDescription().toString();
-            assertTrue(id + "/" + route + "/" + label, spoken.contains("Scheduled stops."));
+            assertTrue(id + "/" + route + "/" + label, spoken.contains("Scheduled stops.")
+                || spoken.contains("Representative scheduled route."));
             assertTrue(spoken.startsWith(name + ", " + BoardView.displayRoute(route)
                 + (BoardView.isExpress(route) ? " express" : "") + " " + label));
             assertEquals(count > 0, spoken.contains("Train in 13 min · Terminal 0"));
@@ -393,13 +394,14 @@ public class HostUiTest {
         .performClick();
     Shadows.shadowOf(Looper.getMainLooper()).idle();
     named(s, "Sat").performClick();
-    named(s, "Chime for each catchable train     Off").performClick();
+    named(s, "Repeat for the next recommended train     Off").performClick();
     named(s, "Display").performClick();
     named(s, "Reduce motion     Off").performClick();
     named(s, "Save").performClick();
     assertEquals("A24", saved[0].getString("station"));
-    assertEquals("[\"A\",\"C\"]", saved[0].getJSONArray("routes").toString());
+    assertEquals("[\"C\"]", saved[0].getJSONArray("routes").toString());
     assertEquals("N", saved[0].getString("direction"));
+    assertEquals("N", saved[0].getString("tripDirection"));
     assertEquals(11, saved[0].getInt("walk"));
     assertEquals(63, saved[0].getInt("days"));
     assertEquals(570, saved[0].getInt("end"));
@@ -411,7 +413,6 @@ public class HostUiTest {
     SettingsScreen reopened = new SettingsScreen(activity, catalog(), saved[0], listener);
     show(reopened);
     assertTrue(named(reopened, "Uptown, selected").isSelected());
-    assertTrue(named(reopened, "A, selected").isSelected());
     assertTrue(named(reopened, "C, selected").isSelected());
     named(reopened, "‹   Cancel").performClick();
     assertTrue(canceled);
@@ -428,9 +429,219 @@ public class HostUiTest {
     s.setStations(replacement);
     named(s, "Save").performClick();
     assertNull(saved[0]);
-    named(s, "2").performClick();
+    named(s, "2, not selected").performClick();
     named(s, "Save").performClick();
     assertEquals("2", saved[0].getString("route"));
+  }
+
+  @Test
+  public void tripChoicesMigratePerServiceAndFilterExactDestination() throws Exception {
+    JSONObject station = new JSONObject().put("id", "M16")
+        .put("routes", new JSONArray().put("J").put("M").put("Z"))
+        .put("directions", new JSONObject().put("N", "Outbound").put("S", "Manhattan"))
+        .put("routeDirections", new JSONObject()
+            .put("J", new JSONArray().put("N").put("S"))
+            .put("M", new JSONArray().put("N").put("S"))
+            .put("Z", new JSONArray().put("N").put("S")));
+    JSONObject evidence = new JSONObject().put("tripDirectionOverrides", new JSONObject()
+        .put("M16", new JSONObject().put("directions", new JSONObject()
+            .put("Manhattan", new JSONObject().put("J", "S").put("M", "N").put("Z", "S"))
+            .put("Outbound", new JSONObject().put("J", "N").put("M", "S").put("Z", "N")))));
+    TripChoices choices = new TripChoices(evidence);
+    JSONObject legacy = new JSONObject().put("station", "M16").put("route", "J")
+        .put("routes", new JSONArray().put("J").put("M").put("Z")).put("direction", "S");
+    choices.migrate(legacy, station);
+    assertEquals("S", legacy.getString("direction"));
+    assertEquals("Manhattan", legacy.getString("tripDirection"));
+    assertEquals("S", TripChoices.platformDirection(legacy, "J"));
+    assertEquals("N", TripChoices.platformDirection(legacy, "M"));
+    assertEquals("S", TripChoices.platformDirection(legacy, "Z"));
+    String first = legacy.getJSONObject("directionsByRoute").toString();
+    choices.migrate(legacy, station);
+    assertEquals(first, legacy.getJSONObject("directionsByRoute").toString());
+    JSONObject unavailable = new JSONObject().put("routes", new JSONArray().put("J").put("M"))
+        .put("route", "J").put("direction", "S");
+    new TripChoices(new JSONObject()).migrate(unavailable, station);
+    assertEquals("S", unavailable.getString("direction"));
+    assertEquals("", TripChoices.platformDirection(unavailable, "J"));
+
+    JSONObject mOnly = new JSONObject().put("route", "M").put("routes", new JSONArray().put("M"))
+        .put("direction", "S");
+    choices.migrate(mOnly, station);
+    assertEquals("S", mOnly.getString("direction"));
+    assertEquals("N", TripChoices.platformDirection(mOnly, "M"));
+    JSONObject switched = new JSONObject().put("tripDirection", "Outbound")
+        .put("direction", "S");
+    JSONObject outboundMap = choices.directionsFor(station, "Outbound", new JSONArray().put("J").put("M"));
+    assertEquals("N", outboundMap.getString("J"));
+    assertEquals("S", outboundMap.getString("M"));
+    assertEquals("S", switched.getString("direction"));
+
+    JSONObject destination = new JSONObject().put("destinationId", "D16").put("destination", "Broad St");
+    JSONObject terminal = new JSONObject().put("terminalId", "D16").put("terminalName", "Broad St");
+    assertTrue(TripChoices.acceptsDestination(destination, terminal));
+    assertFalse(TripChoices.acceptsDestination(destination, new JSONObject()
+        .put("terminalId", "J12").put("terminalName", "Broad St")));
+    assertFalse(TripChoices.acceptsDestination(destination, new JSONObject().put("destination", "Broad St")));
+    assertTrue(TripChoices.acceptsDestination(new JSONObject().put("destination", "Broad St"), terminal));
+    assertTrue(TripChoices.acceptsDestination(new JSONObject(), new JSONObject().put("destination", "anything")));
+  }
+
+  @Test
+  public void stationSearchMatchesWordsAcrossFieldsAndRouteTokens() throws Exception {
+    JSONArray routes = new JSONArray().put("N").put("Q").put("R").put("W");
+    assertTrue(SettingsScreen.matchesStationQuery("Union Square", "14 St-Union Sq · Broadway · Manhattan", routes));
+    assertTrue(SettingsScreen.matchesStationQuery("Times Square", "Times Sq-42 St · Broadway · Manhattan", routes));
+    assertTrue(SettingsScreen.matchesStationQuery("125 St Broadway", "125 St · Broadway · Manhattan", new JSONArray().put("1")));
+    assertFalse(SettingsScreen.matchesStationQuery("N", "Union Sq · Broadway · Manhattan", new JSONArray().put("1")));
+    assertTrue(SettingsScreen.matchesStationQuery("N", "Union Sq · Broadway · Manhattan", routes));
+  }
+
+  @Test
+  public void scheduledTerminalChoicesUseLastServedStationAndExcludeShortTurns() throws Exception {
+    JSONObject atlas = new JSONObject(Files.readString(Paths.get(System.getProperty("assetDir"), "nyc/network.json")));
+    JSONArray stations = catalog();
+    TripChoices choices = new TripChoices(atlas);
+    JSONObject one = findStation(stations, "116");
+    JSONObject south = new JSONObject().put("routes", new JSONArray().put("1"))
+        .put("directionsByRoute", new JSONObject().put("1", "S"));
+    JSONArray southChoices = choices.destinationsFor(one, south);
+    assertTrue(containsTerminal(southChoices, "142", "South Ferry"));
+
+    JSONObject seven = findStation(stations, "702");
+    JSONObject sevenTrip = new JSONObject().put("routes", new JSONArray().put("7"))
+        .put("directionsByRoute", new JSONObject().put("7", "N"));
+    JSONArray sevenChoices = choices.destinationsFor(seven, sevenTrip);
+    assertTrue(containsTerminal(sevenChoices, "701", "Flushing-Main St"));
+    assertFalse("short-turn destination must differ from the selected origin",
+        containsTerminal(sevenChoices, "702", "Mets-Willets Point"));
+    assertTrue(choices.onwardSummary(one, south).contains("116 St-Columbia University"));
+  }
+
+  private static JSONObject findStation(JSONArray stations, String id) {
+    for (int i = 0; i < stations.length(); i++) {
+      JSONObject station = stations.optJSONObject(i);
+      if (station != null && id.equals(station.optString("id"))) return station;
+    }
+    throw new AssertionError("Missing station " + id);
+  }
+
+  private static boolean containsTerminal(JSONArray options, String id, String name) {
+    for (int i = 0; i < options.length(); i++) {
+      JSONObject option = options.optJSONObject(i);
+      if (option != null && id.equals(option.optString("terminalId"))
+          && name.equals(option.optString("terminalName"))) return true;
+    }
+    return false;
+  }
+
+  @Test
+  public void namedTripSwitchingDoesNotReplaceGlobalPreferencesOrDestination() throws Exception {
+    JSONObject prefs = prefs().put("destination", "Broad St");
+    JSONObject savedTrip = new JSONObject().put("name", "Home")
+        .put("station", "116").put("route", "1").put("routes", new JSONArray().put("1"))
+        .put("direction", "S").put("tripDirection", "S")
+        .put("directionsByRoute", new JSONObject().put("1", "S"))
+        .put("walk", 12).put("buffer", 2);
+    prefs.put("namedTrips", new JSONArray().put(savedTrip));
+    SettingsScreen screen = new SettingsScreen(activity, catalog(), prefs, listener);
+    named(screen, "Home").performClick();
+    JSONObject changed = screen.draft();
+    assertEquals("116", changed.getString("station"));
+    assertEquals("", changed.optString("destination"));
+    assertEquals(prefs.getBoolean("chime"), changed.getBoolean("chime"));
+    assertEquals(12, changed.getInt("walk"));
+    assertEquals(2, changed.getInt("buffer"));
+    named(screen, "Manage saved trips").performClick();
+    AlertDialog manage = ShadowAlertDialog.getLatestAlertDialog();
+    ListView saved = first(manage.getWindow().getDecorView(), ListView.class);
+    saved.performItemClick(saved.getAdapter().getView(0, null, saved), 0, saved.getAdapter().getItemId(0));
+    assertEquals(0, screen.draft().getJSONArray("namedTrips").length());
+  }
+
+  @Test
+  public void settingsRecreationRestoresDraftSourceAndUncommittedAddress() throws Exception {
+    JSONObject draft = prefs().put("server", "draft-host:8765").put("walk", 23);
+    JSONObject ui = new JSONObject().put("draft", draft).put("section", 3)
+        .put("scrollY", 0).put("usePhone", false).put("serverFocused", true);
+    SettingsScreen restored = new SettingsScreen(activity, catalog(), prefs(), listener, ui);
+    assertTrue(named(restored, "Home server").isSelected());
+    assertEquals("draft-host:8765", first(restored, EditText.class).getText().toString());
+    JSONObject saved = restored.uiState();
+    assertFalse(saved.getBoolean("usePhone"));
+    assertEquals("draft-host:8765", saved.getJSONObject("draft").getString("server"));
+    assertEquals(23, saved.getJSONObject("draft").getInt("walk"));
+  }
+
+  @Test
+  public void unlistedDestinationFilterSurvivesSettingsRedraw() throws Exception {
+    JSONObject current = prefs().put("destinationId", "legacy-terminal")
+        .put("destination", "Old Terminal Name");
+    SettingsScreen screen = new SettingsScreen(activity, catalog(), current, listener);
+    assertEquals("legacy-terminal", screen.draft().getString("destinationId"));
+    assertEquals("Old Terminal Name", screen.draft().getString("destination"));
+    named(screen, "Sound").performClick();
+    assertEquals("legacy-terminal", screen.draft().getString("destinationId"));
+    assertEquals("Old Terminal Name", screen.draft().getString("destination"));
+  }
+
+  @Test
+  public void reselectingCurrentStationKeepsNewTerminalFilter() throws Exception {
+    SettingsScreen screen = new SettingsScreen(activity, catalog(), prefs(), listener);
+    android.widget.Spinner spinner = first(screen, android.widget.Spinner.class);
+    int southFerry = -1;
+    for (int i = 1; i < spinner.getCount(); i++)
+      if ("South Ferry".equals(spinner.getItemAtPosition(i))) southFerry = i;
+    assertTrue(southFerry > 0);
+    spinner.setSelection(southFerry);
+    tree(screen).stream().filter(v -> v instanceof TextView
+        && ((TextView) v).getText().toString().startsWith("125 St")).findFirst().get().performClick();
+    View dialog = ShadowAlertDialog.getLatestAlertDialog().getWindow().getDecorView();
+    first(dialog, EditText.class).setText("125 St Broadway");
+    ListView list = first(dialog, ListView.class);
+    assertTrue(list.getCount() > 0);
+    list.performItemClick(list.getAdapter().getView(0, null, list), 0, list.getAdapter().getItemId(0));
+    named(screen, "Save").performClick();
+    assertEquals("142", saved[0].getString("destinationId"));
+    assertEquals("South Ferry", saved[0].getString("destination"));
+  }
+
+  @Test
+  public void stationPickerRequiresDirectionBeforeAddingReversedJAndMServices() throws Exception {
+    SettingsScreen screen = new SettingsScreen(activity, catalog(), prefs(), listener);
+    View picker = tree(screen).stream().filter(v -> v instanceof TextView
+        && ((TextView) v).getText().toString().startsWith("125 St")).findFirst().get();
+    picker.performClick();
+    AlertDialog dialog = ShadowAlertDialog.getLatestAlertDialog();
+    EditText query = first(dialog.getWindow().getDecorView(), EditText.class);
+    query.setText("Marcy Av");
+    ListView list = first(dialog.getWindow().getDecorView(), ListView.class);
+    assertTrue(list.getCount() > 0);
+    list.performItemClick(list.getAdapter().getView(0, null, list), 0, list.getAdapter().getItemId(0));
+    assertTrue(screen.draft().getJSONArray("routes").length() == 0);
+    assertFalse(named(screen, "J, unavailable in selected direction").isEnabled());
+    assertFalse(named(screen, "M, unavailable in selected direction").isEnabled());
+    named(screen, "Save").performClick();
+    assertNull("unresolved Marcy directions cannot become a saved trip", saved[0]);
+    named(screen, "Toward Manhattan").performClick();
+    named(screen, "J").performClick();
+    named(screen, "M").performClick();
+    named(screen, "Save").performClick();
+    assertEquals("S", saved[0].getString("direction"));
+    assertEquals("Manhattan", saved[0].getString("tripDirection"));
+    assertEquals("S", TripChoices.platformDirection(saved[0], "J"));
+    assertEquals("N", TripChoices.platformDirection(saved[0], "M"));
+    SettingsScreen reopened = new SettingsScreen(activity, catalog(), saved[0], listener);
+    assertTrue(named(reopened, "Toward Manhattan, selected").isSelected());
+    assertTrue(named(reopened, "J, selected").isSelected());
+    assertTrue(named(reopened, "M, selected").isSelected());
+
+    JSONObject mOnly = new JSONObject().put("station", "M16").put("route", "M")
+        .put("routes", new JSONArray().put("M")).put("direction", "S");
+    SettingsScreen singleM = new SettingsScreen(activity, catalog(), mOnly, listener);
+    assertEquals("S", singleM.draft().getString("direction"));
+    assertEquals("Manhattan", singleM.draft().getString("tripDirection"));
+    assertEquals("N", TripChoices.platformDirection(singleM.draft(), "M"));
   }
 
   @Test

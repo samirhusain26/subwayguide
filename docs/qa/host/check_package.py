@@ -1,5 +1,7 @@
 """Check the locally built APK with its build interpreter (CPython 3.11, -I -S)."""
 import argparse
+import hashlib
+import importlib.metadata
 import importlib.util
 import io
 import json
@@ -22,6 +24,32 @@ def check(apk_path, work, live):
         seed = apk.read("assets/stations.json")
         assert seed == (ROOT / "server/stations.json").read_bytes(), "outdated APK station directory"
         atlas = ROOT / "android/app/src/main/assets/nyc"
+        tiles = {f"8-{x}-{y}.png" for x in range(16) for y in range(16)}
+        tiles.update(f"64-{x}-{y}.png" for x in range(-4, 4) for y in range(-3, 5))
+        assert {p.name for p in atlas.glob("*.png")} == tiles, "incomplete source atlas"
+        manifest = json.loads((atlas / "manifest.json").read_bytes())
+        assert set(manifest["files"]) == tiles | {"network.json"}, "incomplete atlas manifest"
+        for name, digest in manifest["files"].items():
+            assert hashlib.sha256(apk.read("assets/nyc/" + name)).hexdigest() == digest, name
+        packaged = {key.removeprefix("assets/nyc/") for key in apk.namelist() if key.startswith("assets/nyc/")}
+        assert packaged == {p.name for p in atlas.iterdir() if p.is_file()}, "APK atlas inventory differs"
+        for file in sorted((ROOT / "android/app/src/main/assets").glob("*.json")):
+            assert apk.read("assets/" + file.name) == file.read_bytes(), f"outdated configuration: {file.name}"
+        directions = (ROOT / "server/trip_data/trip_direction_overrides.json").read_bytes()
+        assert apk.read("assets/trip_direction_overrides.json") == directions, "outdated Android directions"
+        network = json.loads(apk.read("assets/nyc/network.json"))
+        corridor = ["M11", "M12", "M13", "M14", "M16", "M18"]
+        for index, station in enumerate(corridor):
+            mappings = json.loads(directions)[station]["directions"]["Manhattan"]
+            for route in ("J", "M"):
+                platform = station + mappings[route]
+                onward = {stops[i + 1][:-1] for _, _, stops in network["routes"][route]
+                          for i, stop in enumerate(stops[:-1]) if stop == platform}
+                if index + 1 < len(corridor):
+                    expected = corridor[index + 1]
+                else:
+                    expected = "D21" if route == "M" else "M19"
+                assert expected in onward, f"invalid {route} boarding direction at {station}"
         for file in atlas.iterdir():
             assert apk.read("assets/nyc/" + file.name) == file.read_bytes(), f"outdated map asset: {file.name}"
         for abi, machine in (("armeabi-v7a", 40), ("arm64-v8a", 183)):
@@ -32,7 +60,8 @@ def check(apk_path, work, live):
                 inner.extractall(work / "modules")
 
     modules = work / "modules"
-    for name in ("context_feeds", "embedded_board", "refresh_catalog", "serve", "transit", "update_downloader"):
+    assert (modules / "trip_data/trip_direction_overrides.json").read_bytes() == directions, "outdated service directions"
+    for name in ("context_feeds", "embedded_board", "refresh_catalog", "serve", "transit", "trip_data/__init__", "update_downloader"):
         shipped = (modules / f"{name}.pyc").read_bytes()
         assert shipped[:4] == importlib.util.MAGIC_NUMBER, "run with the Python 3.11 build interpreter"
         code = marshal.loads(shipped[16:])
@@ -41,6 +70,9 @@ def check(apk_path, work, live):
         assert compile(source, code.co_filename, "exec") == code, f"outdated APK module: {name}"
 
     sys.path.insert(0, str(modules))
+    for name, version in {"certifi": "2026.11.20", "tzdata": "2026.6", "protobuf": "6.33.6",
+                          "gtfs-realtime-bindings": "1.0.0"}.items():
+        assert importlib.metadata.version(name) == version, f"unexpected packaged {name} version"
     import certifi
     import embedded_board
     import serve
@@ -64,7 +96,7 @@ def check(apk_path, work, live):
 
         with patch.object(serve, "get_arrivals", return_value={
             "status": "ok", "feedTime": 1, "arrivals": [{"id": "sample", "time": 600}]
-        }), patch.object(serve, "notice_state_for", return_value=(True, None)), patch.object(
+        }), patch.object(serve, "notice_states_for", return_value=(True, {"1": None})), patch.object(
             serve, "weather_for", return_value=None
         ):
             sample = json.loads(embedded_board.board_json("116", "1", "S"))

@@ -13,13 +13,25 @@ import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.view.Gravity;
 import android.view.View;
+import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.animation.DecelerateInterpolator;
 import android.widget.FrameLayout;
 import android.widget.ImageButton;
 import java.util.Locale;
+import java.util.List;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /** A single sign face, laid out in 640 x 360 design units, with a native settings target. */
 public final class BoardView extends FrameLayout {
+  private static final ThreadPoolExecutor MAP_COMPOSER = new ThreadPoolExecutor(1, 1,
+      0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(), runnable -> {
+        Thread thread = new Thread(runnable, "Board-map-composer");
+        thread.setDaemon(true);
+        return thread;
+      });
   static final int PAPER = 0xfff7f6ed;
   private static final int INK = 0xff17231e, MUTED = 0xff43564b;
   private static final Typeface NORMAL = Typeface.create("sans-serif", Typeface.NORMAL);
@@ -29,9 +41,17 @@ public final class BoardView extends FrameLayout {
   private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
   private String selection = "", station = "", route = "", direction = "";
   private String headline = "", detail = "", weatherKind = "", weather = "", alert = "";
+  private String routeStatus = "", platformArrivals = "", consideredLines = "";
+  private int walkMinutes, bufferMinutes;
+  private List<String> onwardStops = java.util.Collections.emptyList();
   private Decision guidance;
   private long now;
-  private Bitmap background;
+  private volatile Bitmap background;
+  private volatile int backgroundRevision = -1;
+  private volatile int mapRevision;
+  private final Object bitmapLock = new Object();
+  private FutureTask<Void> mapTask;
+  private final boolean asyncMapComposition;
   private final android.graphics.Rect mapBounds = new android.graphics.Rect();
   private boolean mapDirty = true;
   private final RouteMap map;
@@ -42,39 +62,55 @@ public final class BoardView extends FrameLayout {
   private float phase = 1;
   private final View spokenBoard;
   private final ImageButton settings;
+  private final Runnable openSettings;
 
   public BoardView(Context context, Runnable openSettings) {
-    this(context, openSettings, context.getAssets()::open);
+    this(context, openSettings, name -> LocalBoard.openAsset(context, name), true);
   }
 
   BoardView(Context context, Runnable openSettings, RouteMap.Assets assets) {
+    this(context, openSettings, assets, false);
+  }
+
+  private BoardView(Context context, Runnable openSettings, RouteMap.Assets assets,
+      boolean asyncMapComposition) {
     super(context);
+    this.openSettings = openSettings;
+    this.asyncMapComposition = asyncMapComposition;
     map = new RouteMap(assets);
     setWillNotDraw(false);
     setBackgroundColor(PAPER);
     spokenBoard = new View(context);
     spokenBoard.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_YES);
     addView(spokenBoard, new LayoutParams(-1, -1));
-    spokenBoard.setOnClickListener(
-        v -> {
-          if (!alert.isEmpty())
-            new AlertDialog.Builder(context)
-                .setTitle("Service notice")
-                .setMessage(alert)
-                .setPositiveButton("Done", null)
-                .show();
-          else if (headline.equals("Connect your board") || headline.equals("Service offline"))
-            openSettings.run();
-        });
+    spokenBoard.setOnClickListener(v -> showExplanation(context));
+    spokenBoard.setAccessibilityDelegate(new View.AccessibilityDelegate() {
+      @Override public void onInitializeAccessibilityNodeInfo(View host, AccessibilityNodeInfo info) {
+        super.onInitializeAccessibilityNodeInfo(host, info);
+        info.addAction(new AccessibilityNodeInfo.AccessibilityAction(
+            AccessibilityNodeInfo.ACTION_CLICK, "Explain departure"));
+      }
+    });
+    spokenBoard.setFocusable(true);
+    spokenBoard.setContentDescription("Departure board");
     mapTarget = new View(context);
     mapTarget.setFocusable(true);
     mapTarget.setOnClickListener(v -> {
       fullRoute = !fullRoute;
       mapDirty = true;
+      mapRevision++;
+      discardBackground();
       describeMapControl();
+      if (asyncMapComposition) queueMapComposition();
       invalidate();
     });
     addView(mapTarget, new LayoutParams(1, 1));
+    View noticeTarget = new View(context);
+    noticeTarget.setFocusable(true);
+    noticeTarget.setContentDescription("Service notice. Tap to read.");
+    noticeTarget.setOnClickListener(v -> showNotice(context));
+    addView(noticeTarget, new LayoutParams(1, 1));
+    noticeTarget.setTag("service-notice-action");
     settings = new ImageButton(context);
     settings.setContentDescription("Settings");
     settings.setImageDrawable(new SettingsIcon());
@@ -96,6 +132,22 @@ public final class BoardView extends FrameLayout {
     return Math.round(value * getResources().getDisplayMetrics().density);
   }
 
+  /** Supplies route-specific coverage and the evidence used to explain the chosen train. */
+  void updateContext(String routeStatus, String platformArrivals, int walkMinutes,
+      int bufferMinutes, List<String> onwardStops) {
+    updateContext(routeStatus, platformArrivals, walkMinutes, bufferMinutes, onwardStops, "");
+  }
+
+  void updateContext(String routeStatus, String platformArrivals, int walkMinutes,
+      int bufferMinutes, List<String> onwardStops, String consideredLines) {
+    this.routeStatus = routeStatus == null ? "" : routeStatus.trim();
+    this.platformArrivals = platformArrivals == null ? "" : platformArrivals.trim();
+    this.walkMinutes = Math.max(0, walkMinutes);
+    this.bufferMinutes = Math.max(0, bufferMinutes);
+    this.onwardStops = onwardStops == null ? java.util.Collections.emptyList() : new java.util.ArrayList<>(onwardStops);
+    this.consideredLines = consideredLines == null ? "" : consideredLines.trim();
+  }
+
   public void update(
       String stationId, String station, String route, String side, String direction,
       String headline, String detail, String next, String weatherKind, String weather, String alert,
@@ -111,13 +163,18 @@ public final class BoardView extends FrameLayout {
     String destination = hasTarget ? guidance.targetDestination : "";
     String actualRoute = hasTarget && !guidance.primary.route.isEmpty() ? guidance.primary.route : route;
     String onward = hasTarget ? guidance.primary.onward : "";
-    String pattern = actualRoute + "/" + onward + "/" + destination;
+    String terminalId = hasTarget ? guidance.primary.terminalId : "";
+    String pattern = actualRoute + "/" + onward + "/" + destination + "/" + onwardStops.toString()
+        + "/" + terminalId;
     if (newSelection || !mapPattern.equals(pattern)) {
       if (newSelection) fullRoute = false;
-      map.select(stationId, actualRoute, side, destination, onward);
+      map.select(stationId, actualRoute, side, destination, onward, onwardStops, terminalId);
       mapPattern = pattern;
       mapDirty = true;
+      mapRevision++;
+      discardBackground();
       describeMapControl();
+      if (asyncMapComposition) queueMapComposition();
     }
     this.selection = selected;
     this.station = station;
@@ -132,18 +189,30 @@ public final class BoardView extends FrameLayout {
     this.now = now;
     String description = station + ", " + displayRoute(actualRoute)
         + (isExpress(actualRoute) ? " express" : "") + " " + direction + ". " + headline + ". " + detail
-        + (next.isEmpty() ? "" : ". Platform arrivals: " + next.replace("\n", "; "))
+        + (next.isEmpty() && platformArrivals.isEmpty() ? "" : ". Platform arrivals: "
+            + (platformArrivals.isEmpty() ? next : platformArrivals).replace("\n", "; "))
+        + (routeStatus.isEmpty() ? "" : ". " + routeStatus)
         + (weather.isEmpty() ? "" : ". Forecast: " + weather)
         + (alert.isEmpty() ? "" : ". Service notice: " + alert);
+    if (hasTarget) description += ". Walk " + walkMinutes + " minutes"
+        + (bufferMinutes > 0 ? ", with " + bufferMinutes + " minute boarding allowance" : "") + ".";
     description += ". " + map.description();
     if (hasTarget && guidance.followingTime > 0) {
-      description += ". " + alternateCue() + ". Following train in " + eta(guidance.followingTime)
+      description += (sameLeaveCue()
+          ? ". Both trains share the same leave time" : ". " + alternateCue())
+          + ". Following train in " + eta(guidance.followingTime)
           + (guidance.followingRoute.isEmpty() ? "" : " on " + routeName(guidance.followingRoute))
           + (guidance.followingDestination.isEmpty() ? "" : ", " + guidance.followingDestination);
     }
     if (!description.contentEquals(spokenBoard.getContentDescription() == null
         ? "" : spokenBoard.getContentDescription())) spokenBoard.setContentDescription(description);
-    spokenBoard.setClickable(!alert.isEmpty() || headline.equals("Service offline"));
+    spokenBoard.setClickable(true);
+    View noticeAction = findViewWithTag("service-notice-action");
+    if (noticeAction != null) {
+      noticeAction.setVisibility(alert.isEmpty() ? GONE : VISIBLE);
+      noticeAction.setContentDescription("Service notice. " + alert + ". Tap to read.");
+    }
+    layoutNoticeAction();
     if (reduceMotion || newSelection || !hasTarget || targetChanged) stopMotion();
     if (targetChanged && !reduceMotion && isShown()) {
       phase = 0;
@@ -163,6 +232,35 @@ public final class BoardView extends FrameLayout {
     return decision != null && decision.targetTime > 0;
   }
 
+  private void showNotice(Context context) {
+    if (!alert.isEmpty()) new AlertDialog.Builder(context).setTitle("Service notice")
+        .setMessage(alert).setPositiveButton("Done", null).show();
+  }
+
+  private void showExplanation(Context context) {
+    String message;
+    if (hasTarget(guidance)) {
+      String targetRoute = guidance.targetRoute.isEmpty() ? route : guidance.targetRoute;
+      message = "Target train · " + displayRoute(targetRoute)
+          + (isExpress(targetRoute) ? " express" : "")
+          + (guidance.targetDestination.isEmpty() ? "" : " to " + guidance.targetDestination)
+          + ", in " + eta(guidance.targetTime)
+          + "\nLines checked: " + (consideredLines.isEmpty()
+              ? routeName(route) + (guidance.followingTime > 0 && !guidance.followingRoute.isEmpty()
+                  && !guidance.followingRoute.equals(route) ? ", " + routeName(guidance.followingRoute) : "")
+              : consideredLines)
+          + "\nWalk: " + walkMinutes + " min"
+          + (bufferMinutes > 0 ? "\nBoarding allowance: " + bufferMinutes + " min" : "")
+          + (routeStatus.isEmpty() ? "" : "\n" + routeStatus);
+    } else {
+      message = detail + (platformArrivals.isEmpty() ? "" : "\nPlatform arrivals: " + platformArrivals)
+          + (routeStatus.isEmpty() ? "" : "\n" + routeStatus);
+    }
+    if (map.representative()) message += "\nRepresentative scheduled route.";
+    new AlertDialog.Builder(context).setTitle(headline.isEmpty() ? "Departure" : headline)
+        .setMessage(message).setPositiveButton("Done", null).show();
+  }
+
   private void stopMotion() {
     if (change != null) change.cancel();
     change = null;
@@ -172,19 +270,41 @@ public final class BoardView extends FrameLayout {
   @Override
   protected void onDetachedFromWindow() {
     stopMotion();
+    cancelMapComposition();
+    discardBackground();
     super.onDetachedFromWindow();
+  }
+
+  @Override protected void onAttachedToWindow() {
+    super.onAttachedToWindow();
+    if (asyncMapComposition) queueMapComposition();
   }
 
   @Override
   protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
     super.onSizeChanged(width, height, oldWidth, oldHeight);
     mapDirty = true;
+    if (asyncMapComposition) {
+      mapRevision++;
+      discardBackground();
+      queueMapComposition();
+    }
   }
 
   private void describeMapControl() {
     mapTarget.setVisibility(map.available() ? VISIBLE : GONE);
     mapTarget.setContentDescription((fullRoute ? "Show nearby stops. " : "Show full scheduled route. ")
         + map.description());
+  }
+
+  private void layoutNoticeAction() {
+    View noticeAction = findViewWithTag("service-notice-action");
+    if (noticeAction == null) return;
+    float scale = Math.min(getWidth() / 640f, getHeight() / 360f);
+    int left = Math.round((getWidth() - 640 * scale) / 2);
+    int top = Math.round((getHeight() - 360 * scale) / 2);
+    noticeAction.layout(left + Math.round(20 * scale), top + Math.round(320 * scale),
+        left + Math.round(620 * scale), top + Math.round(358 * scale));
   }
 
   @Override
@@ -195,21 +315,94 @@ public final class BoardView extends FrameLayout {
     int y = Math.round((getHeight() - 360 * scale) / 2);
     mapTarget.layout(x + Math.round(RouteMap.LEFT * scale), y, x + Math.round(640 * scale),
         y + Math.round(RouteMap.BOTTOM * scale));
+    layoutNoticeAction();
   }
 
-  private void composeMap(float scale) {
-    float resolution = Math.min(1f, 1920f / Math.max(getWidth(), getHeight()));
-    int width = Math.max(1, Math.round(getWidth() * resolution));
-    int height = Math.max(1, Math.round(getHeight() * resolution));
-    if (background == null || background.getWidth() != width || background.getHeight() != height) {
-      background = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
-    }
+  private void composeMap() {
+    discardBackground();
+    background = renderMap(map, fullRoute, getWidth(), getHeight());
+    backgroundRevision = mapRevision;
     mapBounds.set(0, 0, getWidth(), getHeight());
-    Canvas cached = new Canvas(background);
-    cached.scale(width / (float)getWidth(), height / (float)getHeight());
-    cached.translate((getWidth() - 640 * scale) / 2, (getHeight() - 360 * scale) / 2);
+  }
+
+  private Bitmap renderMap(RouteMap painter, boolean full, int viewWidth, int viewHeight) {
+    if (viewWidth <= 0 || viewHeight <= 0) return null;
+    float resolution = Math.min(1f, 1920f / Math.max(viewWidth, viewHeight));
+    int width = Math.max(1, Math.round(viewWidth * resolution));
+    int height = Math.max(1, Math.round(viewHeight * resolution));
+    Bitmap rendered = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+    Canvas cached = new Canvas(rendered);
+    float scale = Math.min(viewWidth / 640f, viewHeight / 360f);
+    cached.scale(width / (float)viewWidth, height / (float)viewHeight);
+    cached.translate((viewWidth - 640 * scale) / 2, (viewHeight - 360 * scale) / 2);
     cached.scale(scale, scale);
-    map.draw(cached, fullRoute);
+    painter.draw(cached, full);
+    return rendered;
+  }
+
+  private void discardBackground() {
+    synchronized (bitmapLock) {
+      Bitmap old = background;
+      background = null;
+      backgroundRevision = -1;
+      if (!asyncMapComposition && old != null && !old.isRecycled()) old.recycle();
+    }
+  }
+
+  boolean isMapCompositionReady() {
+    Bitmap current = background;
+    return current != null && !current.isRecycled() && backgroundRevision == mapRevision;
+  }
+
+  private void cancelMapComposition() {
+    synchronized (MAP_COMPOSER) {
+      if (mapTask != null) {
+        mapTask.cancel(true);
+        MAP_COMPOSER.remove(mapTask);
+        mapTask = null;
+      }
+    }
+  }
+
+  private void queueMapComposition() {
+    if (!asyncMapComposition || getWidth() <= 0 || getHeight() <= 0 || mapPattern.isEmpty()) return;
+    final int revision = mapRevision;
+    final int width = getWidth(), height = getHeight();
+    final boolean full = fullRoute;
+    final RouteMap painter = map.snapshot();
+    FutureTask<Void> task = new FutureTask<>(() -> {
+      Bitmap rendered = null;
+      try {
+        rendered = renderMap(painter, full, width, height);
+        if (Thread.currentThread().isInterrupted() || rendered == null) return null;
+        synchronized (bitmapLock) {
+          if (revision != mapRevision || !isAttachedToWindow()) return recycleResult(rendered);
+          background = rendered;
+          backgroundRevision = revision;
+          rendered = null;
+        }
+        mapDirty = false;
+        postInvalidate();
+      } catch (RuntimeException ignored) {
+        // A missing/corrupt offline tile leaves the live text board usable.
+      } finally {
+        if (rendered != null && !rendered.isRecycled()) rendered.recycle();
+      }
+      return null;
+    });
+    synchronized (MAP_COMPOSER) {
+      if (mapTask != null) {
+        mapTask.cancel(true);
+        MAP_COMPOSER.remove(mapTask);
+      }
+      mapTask = task;
+      MAP_COMPOSER.execute(mapTask);
+    }
+  }
+
+  private static Void recycleResult(Bitmap bitmap) {
+    if (!bitmap.isRecycled()) bitmap.recycle();
+    return null;
   }
 
   @Override
@@ -217,15 +410,20 @@ public final class BoardView extends FrameLayout {
     super.onDraw(canvas);
     float scale = Math.min(getWidth() / 640f, getHeight() / 360f);
     if (scale <= 0) return;
-    if (mapDirty) {
-      composeMap(scale);
+    if (!asyncMapComposition && mapDirty) {
+      composeMap();
       mapDirty = false;
     }
     float offsetX = (getWidth() - 640 * scale) / 2;
     float offsetY = (getHeight() - 360 * scale) / 2;
     fill(PAPER);
     paint.setFilterBitmap(true);
-    canvas.drawBitmap(background, null, mapBounds, paint);
+    mapBounds.set(0, 0, getWidth(), getHeight());
+    synchronized (bitmapLock) {
+      Bitmap current = backgroundRevision == mapRevision ? background : null;
+      if (current != null && !current.isRecycled()) canvas.drawBitmap(current, null, mapBounds, paint);
+      else canvas.drawColor(PAPER);
+    }
     canvas.save();
     canvas.translate(offsetX, offsetY);
     canvas.scale(scale, scale);
@@ -237,24 +435,35 @@ public final class BoardView extends FrameLayout {
     if (!route.isEmpty()) drawRouteBullet(canvas, route, 43, 42, 16);
     fitted(station, 67, 44, 23, 14, headingRight - 67, HEAVY, INK, canvas);
     fitted(direction, 67, 64, 14, 12, headingRight - 67, MEDIUM, MUTED, canvas);
+    if (asyncMapComposition && !isMapCompositionReady())
+      fitted("Updating offline map…", RouteMap.LEFT + 10, 22, 12, 10, 180, MEDIUM, MUTED, canvas);
+    if (!routeStatus.isEmpty()) fitted(routeStatus, 35, 76, 13, 11, 258, MEDIUM, MUTED, canvas);
 
     if (hasTarget(guidance)) {
       canvas.save();
       canvas.translate(0, (1 - phase) * 4);
       boolean leaveNow = guidance.leaveNow;
-      text(leaveNow ? "Leave" : "Leave in", 34, 132, 24, MEDIUM, INK, Paint.Align.LEFT, canvas);
+      text(leaveNow ? "Leave" : "Leave in", 34, 111, 24, MEDIUM, INK, Paint.Align.LEFT, canvas);
       String value = leaveNow ? "Now" : leaveValue(guidance.leaveSeconds);
-      float size = fitSize(value, MEDIUM, 132, leaveNow ? 255 : 220);
-      text(value, 30, 239, size, MEDIUM, INK, Paint.Align.LEFT, canvas);
+      float size = fitSize(value, MEDIUM, 162, 340);
+      text(value, 30, 259, size, MEDIUM, INK, Paint.Align.LEFT, canvas);
       if (!leaveNow)
-        text("min", 38 + paint.measureText(value), 237, 28, MEDIUM, INK, Paint.Align.LEFT, canvas);
+        text("min", 38 + paint.measureText(value), 256, 28, MEDIUM, INK, Paint.Align.LEFT, canvas);
       canvas.restore();
-      if (guidance.followingTime > 0)
-        fitted(alternateCue(), 35, 274, 18, 14, 270, MEDIUM, MUTED, canvas);
+      if (guidance.followingTime > 0 && !sameLeaveCue())
+        fitted(alternateCue(), 35, 282, 18, 14, 270, MEDIUM, MUTED, canvas);
       drawOpportunities(canvas);
     } else {
-      fitted(headline, 34, 174, 42, 20, 254, HEAVY, INK, canvas);
+      String visualHeadline = headline.toLowerCase(Locale.US).contains("delayed") ? "Delayed" : headline;
+      float statusSize = visualHeadline.equals("Delayed") ? 78 : 42;
+      fitted(visualHeadline, 34, 174, statusSize, 20, 254, HEAVY, INK, canvas);
       fitted(detail, 35, 205, 17, 14, 254, MEDIUM, MUTED, canvas);
+      if (!platformArrivals.isEmpty()) {
+        fitted("Platform arrivals", 35, 247, 14, 12, 245, MEDIUM, MUTED, canvas);
+        String[] rows = platformArrivals.split("\\n");
+        for (int i = 0; i < Math.min(2, rows.length); i++)
+          fitted(rows[i], 35, 269 + i * 20, 16, 12, 245, MEDIUM, INK, canvas);
+      }
     }
 
     if (!weather.isEmpty()) {
@@ -279,14 +488,24 @@ public final class BoardView extends FrameLayout {
         : "Or leave in " + leaveValue(guidance.alternateLeaveSeconds) + " min";
   }
 
+  private boolean sameLeaveCue() {
+    String primary = guidance.leaveNow ? "Now" : leaveValue(guidance.leaveSeconds);
+    String following = guidance.alternateLeaveSeconds == 0 ? "Now" : leaveValue(guidance.alternateLeaveSeconds);
+    return primary.equals(following);
+  }
+
   private String eta(long time) {
     return ((time - now + 59) / 60) + " min";
   }
 
   private void drawOpportunities(Canvas canvas) {
-    arrival(canvas, 306, guidance.targetTime, guidance.targetDestination, guidance.targetRoute, true);
+    boolean shared = guidance.followingTime > 0
+        && guidance.targetDestination.equalsIgnoreCase(guidance.followingDestination);
+    arrival(canvas, 306, guidance.targetTime, shared ? "" : guidance.targetDestination, guidance.targetRoute, true);
     if (guidance.followingTime > 0)
-      arrival(canvas, 477, guidance.followingTime, guidance.followingDestination, guidance.followingRoute, false);
+      arrival(canvas, 477, guidance.followingTime, shared ? "" : guidance.followingDestination,
+          guidance.followingRoute, false);
+    if (shared) fitted(guidance.targetDestination, 308, 317, 13, 11, 314, NORMAL, MUTED, canvas);
   }
 
   private void arrival(Canvas canvas, float x, long time, String destination, String serviceRoute, boolean primary) {

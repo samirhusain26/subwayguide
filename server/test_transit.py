@@ -66,6 +66,46 @@ class TransitTest(unittest.TestCase):
     def board(self, route="1", direction="S", station=STATION):
         return transit.get_arrivals(station, route, direction, STATIONS)
 
+    def test_rows_carry_inclusive_evidence_expiry_and_ordered_onward_stops(self):
+        trip(self.feed, "old-movement", stops=[("116S", 100, 101), ("137S", 190, None)])
+        update = self.feed.entity[0].trip_update
+        self.vehicle(update, update.trip.trip_id, 80)
+        self.vehicle(update, update.trip.trip_id, 20)
+        row, = self.board()["arrivals"]
+        self.assertEqual(row["validUntil"], NOW + 10)
+        self.assertEqual(row["onward"], "137S")
+        self.assertEqual(row["onwardStops"], ["137S"])
+        self.wall = NOW + 10
+        self.assertLessEqual(self.wall, row["validUntil"])
+        self.wall = NOW + 11
+        # Producer filtering also protects older clients that do not inspect validUntil.
+        self.assertGreater(self.wall, row["validUntil"])
+        self.assertEqual(self.board()["arrivals"], [])
+
+    def test_confirmed_terminal_is_distinct_from_direction_with_same_name(self):
+        station = dict(STATION, directions={"S": "South Ferry"})
+        trip(self.feed, "truncated", stops=[("116S", 10, 11), ("137S", 90, 91)])
+        trip(self.feed, "terminating", stops=[("116S", 20, 21), ("142S", 95, None)])
+        truncated, terminating = self.board(station=station)["arrivals"]
+        self.assertEqual(truncated["destination"], terminating["destination"])
+        self.assertNotIn("terminalId", truncated)
+        self.assertNotIn("terminalName", truncated)
+        self.assertEqual((terminating["terminalId"], terminating["terminalName"]), ("142", "South Ferry"))
+
+    def test_untracked_departure_only_origin_expires_between_polls(self):
+        trip(self.feed, stops=[("115S", None, -80), ("116S", 100, 101), ("142S", 600, None)])
+        row, = self.board()["arrivals"]
+        self.assertEqual(row["validUntil"], NOW + 10)
+        self.wall = NOW + 11
+        self.assertEqual(self.board()["arrivals"], [])
+
+    def test_m_truncated_at_marcy_uses_rider_direction(self):
+        station = dict(STATION, id="M16", directions={"N": "Outbound", "S": "Manhattan"})
+        trip(self.feed, "toward", "M", [("M16N", 10, 11), ("M18N", 90, 91)])
+        result, = self.board(route="M", direction="N", station=station)["arrivals"]
+        self.assertEqual(result["destination"], "Manhattan")
+        self.assertNotIn("terminalId", result)
+
     def test_platform_route_branch_order_origin_and_dwell(self):
         trip(self.feed, "branch", stops=[("116S", 100, 101), ("137S", 190, None)])
         trip(self.feed, "origin", stops=[("116S", None, 60), ("142S", 600, None)])
@@ -132,6 +172,7 @@ class TransitTest(unittest.TestCase):
         car = self.feed.entity.add(id="car-" + str(len(self.feed.entity))).vehicle
         car.trip.CopyFrom(update.trip)
         car.trip.trip_id = raw
+        car.vehicle.id = "vehicle-%d" % len(self.feed.entity)
         car.timestamp = NOW - lag
         return car
 
@@ -388,7 +429,7 @@ class TransitTest(unittest.TestCase):
         self.wall = NOW + 60
         self.assertEqual(self.board()["status"], "ok")
         self.wall += 1
-        self.assertEqual(len(self.board()["arrivals"]), 1)
+        self.assertEqual(self.board()["arrivals"], [])
         self.assertEqual(self.board()["status"], "stale")
         self.wall = NOW + 120
         self.assertEqual(self.board()["status"], "stale")

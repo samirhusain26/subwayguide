@@ -14,6 +14,10 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from google.transit import gtfs_realtime_pb2 as gtfs
+if __package__:
+    from .trip_data import direction_name
+else:
+    from trip_data import direction_name
 
 
 _POINTS = "https://api.weather.gov/points/"
@@ -145,6 +149,12 @@ def _load_weather(coords, previous):
         if not _HOURLY_URL.fullmatch(url):
             raise ValueError("Unexpected NWS forecast URL")
     hourly = _properties(url)
+    updated = _timestamp(hourly["updateTime"])
+    now = time.time()
+    if updated > now or now - updated >= 86400:
+        raise ValueError("Unusable hourly forecast update time")
+    if previous and updated < previous.updated:
+        raise ValueError("Regressed hourly forecast update time")
     periods = []
     for period in hourly["periods"]:
         label = " ".join((period.get("shortForecast") or "").split())
@@ -160,10 +170,10 @@ def _load_weather(coords, previous):
                 if low <= temperature <= high:
                     fields = {"temperature": temperature, "temperatureUnit": unit}
             periods.append((start, end, kind, label, fields))
-    return _Weather(url, mapped_at, tuple(periods), _timestamp(hourly["updateTime"]))
+    return _Weather(url, mapped_at, tuple(periods), updated)
 
 
-_weather_cache = _Cache(_load_weather, workers=2, capacity=64, refresh=900, expire=3600, retry=60)
+_weather_cache = _Cache(_load_weather, workers=2, capacity=64, refresh=900, expire=86400, retry=60)
 
 
 def weather_for(lat, lon) -> dict[str, str | float] | None:
@@ -200,18 +210,19 @@ def _headline(alert):
 # Target text must name the selected station as an object of the exclusion.
 # MTA lists transfer/alternative stations in the very same set of selectors.
 _AREA = re.compile(r"^in (?:upper |lower |the )?(manhattan|bronx|brooklyn|queens|staten island), ")
-_SKIP = re.compile(r"(.+?) (?:skips?|bypasses|bypass|does not stop at|do not stop at) (.+)")
+_SKIP = re.compile(r"(.+?) (?:skips?|bypasses|bypass|does not stop at|do not stop at|will not stop at) (.+)")
 _NO_AT = re.compile(r"no (.+?) (?:service )?at (.+)")
 _SUSPENDED_AT = re.compile(r"(.+?) (?:service is suspended|is suspended|are suspended) at (.+)")
 
 
 def _subject_matches(subject, route, station, direction):
-    label = station["directions"].get(direction, "").casefold()
+    label = direction_name(station, route, direction).casefold()
     prefixes = {"", "northbound " if direction == "N" else "southbound "}
     if label:
-        prefixes.update((label + " ", label + "-bound "))
+        for term in [label, *label.split(" / ")]:
+            prefixes.update((term + " ", term + "-bound "))
     return any(subject == prefix + route + suffix
-               for prefix in prefixes for suffix in ("", " train", " trains"))
+               for prefix in prefixes for suffix in ("", " train", " trains", " service"))
 
 
 def _prevents_boarding(text, route, station, direction, no_service, names):
@@ -232,16 +243,16 @@ def _prevents_boarding(text, route, station, direction, no_service, names):
         return station["name"].casefold() in targets and all(target in names for target in targets)
     if line.endswith(" station is closed"):
         return bool(station and line == station["name"].casefold() + " station is closed")
-    suspended = re.fullmatch(r"(.+?) (?:is|are) suspended", line)
+    suspended = re.fullmatch(r"(.+?) (?:(?:is|are) )?suspended", line)
     if suspended:
         if no_service and suspended[1] in ("service", "trains"):
             return True
         return bool(station and _subject_matches(suspended[1], route.casefold(), station, direction))
     # A narrow/conditional skip outside the supported grammar cannot turn every
     # station selector into a closure, even if an upstream effect is overly broad.
-    if re.search(r"\b(?:skips?|skipping|bypass(?:es|ing)?|some|entrance|exit)\b", line):
+    if re.search(r"\b(?:skips?|skipping|bypass(?:es|ing)?|some|entrance|exit|not stop at|no longer stop at)\b", line):
         return False
-    return no_service
+    return bool(no_service and not line)
 
 
 def _parse_alerts(data):
@@ -269,22 +280,55 @@ def _parse_alerts(data):
         periods = tuple((p.start, p.end if p.HasField("end") else math.inf)
                         for p in alert.active_period)
         for s in alert.informed_entity:
-            # Route-only MTA selectors often describe a single station in prose.
-            # Trip-specific alerts require trip identity that a platform board lacks.
-            if (not s.route_id or not s.stop_id or s.HasField("trip")
-                    or s.agency_id not in ("", "MTASBWY")
+            # Trip-specific selectors cannot be evaluated from a platform board.
+            if (s.HasField("trip") or s.agency_id not in ("", "MTASBWY")
                     or (s.HasField("route_type") and s.route_type != 1)):
                 continue
-            parent = s.stop_id[:-1] if s.stop_id.endswith(("N", "S")) else s.stop_id
-            station = catalog.get(parent)
-            for dir_id, direction in enumerate(("N", "S")):
+            route_only = bool(s.route_id and not s.stop_id)
+            stop_only = bool(s.stop_id and not s.route_id)
+            if route_only:
+                # Expand only an explicit whole-line suspension, never prose that
+                # merely mentions the line while describing one station.
+                subject = re.fullmatch(r"(.+?) (?:(?:is|are) )?suspended",
+                                       (headline or "").casefold().removesuffix("."))
+                if not no_service or not subject:
+                    continue
+                # Rerouted trains may stop where this route has no scheduled pickup.
+                targets = [(s.route_id, station, direction)
+                           for station in stations for direction in ("N", "S")
+                           if _subject_matches(subject[1], s.route_id.casefold(), station, direction)]
+            elif stop_only:
+                parent = s.stop_id[:-1] if s.stop_id.endswith(("N", "S")) else s.stop_id
+                station = catalog.get(parent)
+                # A stop-only selector can close a named station, but cannot
+                # safely join with unrelated route-only selectors.
+                if (station is None or not headline or
+                        headline.casefold().removesuffix(".") != station.get("name", "").casefold() +
+                        " station is closed"):
+                    continue
+                targets = [("*", station, direction) for direction in ("N", "S")]
+            elif s.route_id and s.stop_id:
+                parent = s.stop_id[:-1] if s.stop_id.endswith(("N", "S")) else s.stop_id
+                station = catalog.get(parent)
+                targets = [(s.route_id, station, direction) for direction in ("N", "S")]
+            else:
+                continue
+            for route, station, direction in targets:
+                if station is None:
+                    continue
+                dir_id = 0 if direction == "N" else 1
                 if s.HasField("direction_id") and s.direction_id != dir_id:
                     continue
-                if s.stop_id not in (parent, parent + direction):
+                if s.stop_id and not route_only and s.stop_id not in (station["gtfsParentId"],
+                                                                          station["gtfsParentId"] + direction):
                     continue
-                prevents = _prevents_boarding(headline or "", s.route_id, station, direction, no_service, names)
+                prevents = _prevents_boarding(headline or "", route, station, direction, no_service, names)
+                # Whole-line and whole-station selectors provide the scope when
+                # the explicit headline itself has no station object.
+                if route_only or stop_only:
+                    prevents = True
                 priority = (not prevents, not no_service, not entity.id.startswith("lmm:alert:"), entity.id)
-                by_stop.setdefault((s.route_id, parent, direction), []).append(
+                by_stop.setdefault((route, station["gtfsParentId"], direction), []).append(
                     (priority, periods, display, prevents))
     return feed.header.timestamp, by_stop
 
@@ -299,28 +343,43 @@ def _load_alerts(key, previous):
 _alert_cache = _Cache(_load_alerts, workers=1, capacity=1, refresh=60, expire=300, retry=30)
 
 
-def notice_state_for(route, stopId, direction, now) -> tuple[bool, dict | None]:
-    """Read (alerts ready, active notice) atomically. Gate advice on readiness."""
-    if (not isinstance(route, str) or not isinstance(stopId, str)
-            or direction not in ("N", "S") or not isinstance(now, (float, int))):
-        return False, None
+def notice_states_for(routes, stopId, direction, now) -> tuple[bool, dict[str, dict | None]]:
+    """Evaluate routes against one alert snapshot for an atomic board decision."""
+    if not isinstance(routes, (list, tuple)):
+        return False, {}
+    routes = tuple(dict.fromkeys(routes))
+    if (not routes or any(not isinstance(route, str) or not route for route in routes)
+            or not isinstance(stopId, str) or direction not in ("N", "S")
+            or not isinstance(now, (float, int))):
+        return False, {}
     parent = stopId
     if stopId.endswith(("N", "S")):
         if stopId[-1] != direction:
-            return False, None
+            return False, {}
         parent = stopId[:-1]
-    if not parent or not route:
-        return False, None
+    if not parent:
+        return False, {}
     snapshot = _alert_cache.get(_ALERT_URL)
     if not snapshot or not -60 <= now - snapshot[0] < _MAX_ALERT_AGE:
-        return False, None
-    best = None
-    for priority, periods, headline, prevents in snapshot[1].get((route, parent, direction), ()):
-        if periods and not any(start <= now < end for start, end in periods):
-            continue
-        if best is None or priority < best[0]:
-            best = (priority, {"text": headline, "preventsBoarding": prevents})
-    return True, best[1] if best else None
+        return False, {route: None for route in routes}
+    result = {}
+    for route in routes:
+        best = None
+        candidates = (*snapshot[1].get((route, parent, direction), ()),
+                      *snapshot[1].get(("*", parent, direction), ()))
+        for priority, periods, headline, prevents in candidates:
+            if periods and not any(start <= now < end for start, end in periods):
+                continue
+            if best is None or priority < best[0]:
+                best = (priority, {"text": headline, "preventsBoarding": prevents})
+        result[route] = best[1] if best else None
+    return True, result
+
+
+def notice_state_for(route, stopId, direction, now) -> tuple[bool, dict | None]:
+    """Read (alerts ready, active notice) atomically for one route."""
+    ready, notices = notice_states_for((route,), stopId, direction, now)
+    return ready, notices.get(route)
 
 
 def notice_for(route, stopId, direction, now) -> dict | None:

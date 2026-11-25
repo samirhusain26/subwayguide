@@ -14,13 +14,24 @@ public final class Decision {
     public final long time;
     public final String destination;
 
-    public final String route, onward;
+    public final String route, onward, terminalId;
+    public final List<String> onwardStops;
 
     public Train(String id, long time, String destination) {
       this(id, time, destination, "", "");
     }
 
     public Train(String id, long time, String destination, String route, String onward) {
+      this(id, time, destination, route, onward, Collections.emptyList());
+    }
+
+    public Train(String id, long time, String destination, String route, String onward, List<String> onwardStops) {
+      this(id, time, destination, route, onward, onwardStops, "");
+    }
+
+    public Train(String id, long time, String destination, String route, String onward, List<String> onwardStops, String terminalId) {
+      this.onwardStops = onwardStops;
+      this.terminalId = terminalId == null ? "" : terminalId;
       this.route = route == null ? "" : route;
       this.onward = onward == null ? "" : onward;
       this.id = id == null ? "" : id.trim();
